@@ -4,10 +4,15 @@ Enterprise license gating through the global ``before_request`` hook, and the
 flask-restx defaults every API surface inherits from the app config.
 """
 
+import ssl
 from contextlib import AbstractContextManager
-from typing import NoReturn
+from typing import NoReturn, override
 from unittest.mock import patch
 
+import anyio
+import anyio.lowlevel
+import httpcore
+import httpx
 import pytest
 from flask import Blueprint, Flask, abort
 from flask_restx import Resource
@@ -20,6 +25,64 @@ from tests.helpers.unit.config_override import config_overrides_context
 
 INVALID_STATUSES = [LicenseStatus.INACTIVE, LicenseStatus.EXPIRED, LicenseStatus.LOST]
 VALID_STATUSES = [LicenseStatus.ACTIVE, LicenseStatus.EXPIRING]
+
+
+def test_proxy_tunnel_releases_slot_when_async_handshake_is_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An AnyIO cancellation during CONNECT TLS closes the stream and frees the pool slot."""
+    create_flask_app_with_configs()
+
+    async def request_through_proxy() -> None:
+        tls_started = anyio.Event()
+        stream_closed = anyio.Event()
+
+        class StalledHandshake(httpcore.AsyncMockStream):
+            @override
+            async def start_tls(
+                self, ssl_context: ssl.SSLContext, server_hostname: str | None = None, timeout: float | None = None
+            ) -> NoReturn:
+                assert ssl_context.verify_mode == ssl.CERT_REQUIRED
+                assert server_hostname == "collector.example.com"
+                assert timeout == 0.1
+                tls_started.set()
+                await anyio.sleep_forever()
+                raise AssertionError("the handshake must be cancelled")
+
+            @override
+            async def aclose(self) -> None:
+                await anyio.lowlevel.checkpoint()
+                await super().aclose()
+                stream_closed.set()
+
+        connect_ok = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        streams = iter(
+            [
+                StalledHandshake([connect_ok]),
+                httpcore.AsyncMockStream([connect_ok, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"]),
+            ]
+        )
+
+        async def connect_tcp(*_args: object, **_kwargs: object) -> httpcore.AsyncNetworkStream:
+            return next(streams)
+
+        transport = httpx.AsyncHTTPTransport(
+            proxy="http://proxy.example.com:8080", limits=httpx.Limits(max_connections=1)
+        )
+        pool = transport._pool
+        assert isinstance(pool, httpcore.AsyncHTTPProxy)
+        monkeypatch.setattr(pool._network_backend, "connect_tcp", connect_tcp)
+        async with httpx.AsyncClient(transport=transport, timeout=0.1) as client:
+            url = "https://collector.example.com/"
+            with anyio.fail_after(5):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(client.get, url)
+                    await tls_started.wait()
+                    group.cancel_scope.cancel()
+            assert pool.connections == [], "the cancelled CONNECT tunnel still occupies the only pool slot"
+            assert stream_closed.is_set()
+            response = await client.get(url)
+            assert (response.status_code, response.content) == (200, b"OK")
+
+    anyio.run(request_through_proxy)
 
 
 def _license(status: LicenseStatus | None) -> AbstractContextManager[object]:

@@ -16,6 +16,7 @@ from core.logging.context import init_request_context
 from dify_app import DifyApp
 from enums import DeploymentEdition
 from extensions.ext_socketio import sio
+from libs.httpcore_compat import install_proxy_tunnel_cleanup
 from services.enterprise.enterprise_service import EnterpriseService
 from services.entities.feature_entities import LicenseStatus
 
@@ -98,10 +99,8 @@ def _match_license_gated_surface(path: str) -> _LicenseGatedSurface | None:
 # Application Factory Function
 # ----------------------------
 def create_flask_app_with_configs() -> DifyApp:
-    """
-    create a raw flask app
-    with configs loaded from .env file
-    """
+    """Install process transport compatibility and return a Flask app with the loaded config."""
+    install_proxy_tunnel_cleanup()
     dify_app = DifyApp(__name__)
     dify_app.config.from_mapping(dify_config.model_dump())
     dify_app.config["RESTX_INCLUDE_ALL_MODELS"] = True

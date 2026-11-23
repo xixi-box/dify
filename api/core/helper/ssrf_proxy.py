@@ -343,7 +343,7 @@ def make_request(
 
         except httpx.RequestError as e:
             last_request_error = e
-            logger.warning("Request to URL %s failed on attempt %s: %s", url, retries + 1, e)
+            logger.warning("Outbound HTTP request failed on attempt %s (%s)", retries + 1, type(e).__name__)
             if max_retries == 0:
                 raise
 

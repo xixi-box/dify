@@ -8,6 +8,7 @@ Private networks stay reachable for VPC collector endpoints.
 """
 
 import ipaddress
+import logging
 import socket
 from collections.abc import Mapping
 from typing import override
@@ -25,6 +26,7 @@ from services.tracing.request_log_protection import protect_http_request_logs
 
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _GRPC_MAX_RECEIVE_BYTES = 4 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 def _blocked_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -51,6 +53,7 @@ class SSRFEgress(Egress):
         timeout: float,
         sensitive_url: bool,
     ) -> EgressResponse:
+        """Send a trace HTTP request through SSRF policy and return its bounded response or a safe egress error."""
         # Bounded buffering needs identity bodies, whatever encodings an SDK offers.
         request_headers = {name: value for name, value in headers.items() if name.lower() != "accept-encoding"}
         request_headers["Accept-Encoding"] = "identity"
@@ -60,8 +63,7 @@ class SSRFEgress(Egress):
         # Export calls must not be traced by Dify's own instrumentation.
         token = attach(set_value(_SUPPRESS_INSTRUMENTATION_KEY, True))
         try:
-            with protect_http_request_logs(sensitive_url):
-                response = self._send(method, url, request_headers, content, timeout)
+            response = self._send(method, url, request_headers, content, timeout, sensitive_url=sensitive_url)
         finally:
             detach(token)
         return EgressResponse(
@@ -71,22 +73,32 @@ class SSRFEgress(Egress):
         )
 
     @staticmethod
-    def _send(method: str, url: str, headers: dict[str, str], content: bytes | None, timeout: float) -> httpx.Response:
+    def _send(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        content: bytes | None,
+        timeout: float,
+        *,
+        sensitive_url: bool,
+    ) -> httpx.Response:
+        """Send a prepared trace request once, bounding its response and sanitizing transport failures."""
         # Raise outside the original handler so no credential-bearing exception is chained.
         failure: EgressError | None = None
         response: httpx.Response | None = None
         try:
-            streamed = ssrf_proxy.make_request(
-                method,
-                url,
-                max_retries=0,
-                stream_response=True,
-                timeout=timeout,
-                follow_redirects=False,
-                headers=headers,
-                content=content,
-            )
-            response = ssrf_proxy.buffer_response(streamed, max_response_bytes=MAX_RESPONSE_BYTES)
+            with protect_http_request_logs(sensitive_url):
+                streamed = ssrf_proxy.make_request(
+                    method,
+                    url,
+                    max_retries=0,
+                    stream_response=True,
+                    timeout=timeout,
+                    follow_redirects=False,
+                    headers=headers,
+                    content=content,
+                )
+                response = ssrf_proxy.buffer_response(streamed, max_response_bytes=MAX_RESPONSE_BYTES)
         except ToolSSRFError:
             failure = EgressBlockedError("Destination blocked by the SSRF policy")
         except httpx.ProxyError as error:
@@ -101,7 +113,10 @@ class SSRFEgress(Egress):
             httpx.PoolTimeout,
             httpx.UnsupportedProtocol,
             httpx.LocalProtocolError,
-        ):
+        ) as error:
+            if sensitive_url and isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+                # The request scope redacts SSRF logs for sensitive URLs. Report just the error class.
+                logger.warning("Trace HTTP connection failed (%s)", type(error).__name__)
             failure = EgressError("Destination unreachable", request_sent=False)
         except (httpx.TransportError, ssrf_proxy.ResponseLimitError):
             failure = EgressError("Transport failed after the request was sent", request_sent=True)

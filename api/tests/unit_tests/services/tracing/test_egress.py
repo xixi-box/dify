@@ -1,14 +1,139 @@
+import logging
 import socket
-from collections.abc import Callable
+import ssl
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import override
 
+import httpcore
 import httpx
 import pytest
+from dify_trace_sdk.egress import EgressResponse
 from dify_trace_sdk.errors import EgressBlockedError, EgressError
 
-from core.helper import ssrf_proxy
+from app_factory import create_flask_app_with_configs
+from core.helper import http_client_pooling, ssrf_proxy
 from core.tools.errors import ToolSSRFError
 from services.tracing.egress import MAX_RESPONSE_BYTES, SSRFEgress
+from tests.helpers.unit.config_override import apply_config_overrides
+
+
+class _ProxyStream(httpcore.MockStream):
+    def __init__(self, tls_error: Exception | None) -> None:
+        super().__init__(
+            [b"HTTP/1.1 200 Connection Established\r\n\r\n", b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\nOK"]
+        )
+        self.tls_error = tls_error
+        self.closed = False
+        self.writes: list[bytes] = []
+
+    @override
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        super().write(buffer, timeout)
+        self.writes.append(buffer)
+
+    @override
+    def close(self) -> None:
+        self.closed = True
+        super().close()
+
+    @override
+    def start_tls(
+        self, ssl_context: ssl.SSLContext, server_hostname: str | None = None, timeout: float | None = None
+    ) -> httpcore.NetworkStream:
+        assert server_hostname == "collector.example.com"
+        assert ssl_context.verify_mode == ssl.CERT_REQUIRED
+        assert timeout == 0.1
+        if self.tls_error is not None:
+            raise self.tls_error
+        return self
+
+
+class _ProxyBackend(httpcore.NetworkBackend):
+    def __init__(self, streams: Iterable[_ProxyStream]) -> None:
+        self.streams = iter(streams)
+
+    @override
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        assert (host, port) == ("proxy.example.com", 8080)
+        assert timeout == 0.1
+        assert local_address is None
+        assert socket_options is None
+        return next(self.streams)
+
+
+@pytest.mark.parametrize(
+    ("tls_error", "error_type"),
+    [
+        pytest.param(
+            httpcore.ConnectError(ssl.SSLCertVerificationError("synthetic-private-detail")),
+            "ConnectError",
+            id="certificate-rejected",
+        ),
+        pytest.param(httpcore.ConnectTimeout("synthetic-private-detail"), "ConnectTimeout", id="handshake-timeout"),
+    ],
+)
+@pytest.mark.parametrize("sensitive_url", [False, True], ids=["public-url", "sensitive-url"])
+def test_proxy_tunnel_releases_slot_for_next_trace_export(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tls_error: Exception,
+    error_type: str,
+    sensitive_url: bool,
+) -> None:
+    """A failed TLS upgrade frees the only tunnel slot before the next export."""
+    apply_config_overrides(
+        monkeypatch, SSRF_PROXY_ALL_URL="http://proxy.example.com:8080", HTTP_REQUEST_NODE_SSL_VERIFY=True
+    )
+    monkeypatch.setattr(ssrf_proxy, "_SSRF_CLIENT_LIMITS", httpx.Limits(max_connections=1))
+    factory = http_client_pooling.HttpClientPoolFactory()
+    monkeypatch.setattr(http_client_pooling, "_factory", factory)
+    create_flask_app_with_configs()
+    if sensitive_url:
+        caplog.set_level(logging.DEBUG, logger="httpcore")
+    failed_stream, healthy_stream = _ProxyStream(tls_error), _ProxyStream(None)
+
+    url = "https://collector.example.com/synthetic-private-path"
+    with ssrf_proxy._get_ssrf_client(True) as client:
+        transport = client._transport_for_url(httpx.URL(url))
+        assert isinstance(transport, httpx.HTTPTransport)
+        pool = transport._pool
+        assert isinstance(pool, httpcore.HTTPProxy)
+        pool._network_backend = _ProxyBackend([failed_stream, healthy_stream])
+        egress = SSRFEgress()
+
+        def export() -> EgressResponse:
+            return egress.request(
+                "POST",
+                url,
+                headers={"Authorization": "Bearer synthetic-private-header"},
+                content=b"synthetic-private-body",
+                timeout=0.1,
+                sensitive_url=sensitive_url,
+            )
+
+        with pytest.raises(EgressError, match="Destination unreachable") as raised:
+            export()
+
+        assert raised.value.request_sent is False
+        assert raised.value.__context__ is None
+        assert pool.connections == [], "the failed CONNECT tunnel still occupies the only pool slot"
+        assert failed_stream.closed
+        assert b"CONNECT collector.example.com:443" in b"".join(failed_stream.writes)
+        assert b"POST" not in b"".join(failed_stream.writes)
+        assert error_type in caplog.text
+        assert "synthetic-private" not in caplog.text
+
+        response = export()
+        assert (response.status_code, response.content) == (202, b"OK")
+        assert b"POST /synthetic-private-path" in b"".join(healthy_stream.writes)
 
 
 @dataclass(frozen=True)
