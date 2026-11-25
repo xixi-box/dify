@@ -14,7 +14,7 @@ read-only views:
 
 Design constraints baked into this version:
 
-1. **No new tables** (§8.1). Topology comes from ``WorkflowRun.graph`` (the
+1. **No new tables** (§8.1). Topology comes from ``WorkflowRun.graph_snapshot`` (the
    graph snapshot taken at execution time so the view stays consistent even
    if the draft was edited mid-run). Execution facts come from
    ``WorkflowNodeExecutionModel`` rows already produced by the workflow
@@ -185,16 +185,17 @@ def _is_agent_v2_node(node: Mapping[str, Any]) -> bool:
 
 
 def _graph_nodes(workflow_run: WorkflowRun) -> list[Mapping[str, Any]]:
-    """Parse ``WorkflowRun.graph`` (LongText JSON) into a node list.
+    """Parse the workflow run's resolved graph JSON into a node list.
 
     The graph blob may be missing / unparseable for very old runs; we treat
     that as "no nodes" rather than failing the Inspector, so the panel still
     renders an empty state.
     """
-    if not workflow_run.graph:
+    graph = workflow_run.graph_snapshot
+    if not graph:
         return []
     try:
-        parsed = json.loads(workflow_run.graph)
+        parsed = json.loads(graph)
     except (json.JSONDecodeError, TypeError):
         logger.warning("NodeOutputInspector: workflow_run %s has unparseable graph blob", workflow_run.id)
         return []

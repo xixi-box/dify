@@ -85,9 +85,10 @@ class BaseAppGenerator:
         if workflow_run_id is None:
             raise ValueError("Workflow run id is required when resuming")
         workflow_run = session.get(WorkflowRun, workflow_run_id)
-        if workflow_run is None or workflow_run.graph is None:
+        graph = workflow_run.graph_snapshot if workflow_run is not None else None
+        if graph is None:
             raise ValueError(f"Workflow run graph not found: {workflow_run_id}")
-        set_committed_value(workflow, "graph", workflow_run.graph)
+        set_committed_value(workflow, "graph", graph)
 
     @staticmethod
     def _join_worker_thread(worker_thread: threading.Thread) -> None:

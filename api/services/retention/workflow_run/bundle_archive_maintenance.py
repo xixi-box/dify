@@ -1063,8 +1063,15 @@ class WorkflowRunBundleArchiveMaintenance:
 
     @staticmethod
     def _row_to_dict(row: Any) -> dict[str, Any]:
+        """Compare the same persisted fields and resolved graph used by the archive writer."""
         mapper = inspect(row).mapper
-        return {str(column.name): getattr(row, mapper.get_property_by_column(column).key) for column in mapper.columns}
+        record = {
+            str(column.name): getattr(row, mapper.get_property_by_column(column).key)
+            for column in row.__table__.columns
+        }
+        if isinstance(row, WorkflowRun):
+            record["graph"] = row.graph_snapshot
+        return record
 
     @staticmethod
     def _normalize_record_for_checksum(record: dict[str, Any]) -> dict[str, Any]:

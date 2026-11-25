@@ -5,9 +5,11 @@ from uuid import uuid4
 import pytest
 from aliyun.log.util import Util
 from pytest_mock import MockerFixture
+from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from core.app.apps.base_app_generator import BaseAppGenerator
 from core.repositories.celery_workflow_execution_repository import CeleryWorkflowExecutionRepository
 from core.repositories.sqlalchemy_workflow_execution_repository import SQLAlchemyWorkflowExecutionRepository
 from core.repositories.sqlalchemy_workflow_node_execution_repository import SQLAlchemyWorkflowNodeExecutionRepository
@@ -24,7 +26,7 @@ from graphon.entities import WorkflowExecution as _sqlalchemy_workflow_execution
 from graphon.entities import WorkflowNodeExecution
 from graphon.enums import WorkflowExecutionStatus, WorkflowNodeExecutionStatus, WorkflowType
 from libs.datetime_utils import naive_utc_now
-from models import Account, EndUser, Tenant, WorkflowRun
+from models import Account, EndUser, Tenant, Workflow, WorkflowRun
 from models import CreatorUserRole as _sqlalchemy_workflow_execution_repository_CreatorUserRole
 from models.enums import CreatorUserRole as _workflow_control_persistence_CreatorUserRole
 from models.enums import EndUserType, WorkflowRunTriggeredFrom
@@ -36,7 +38,11 @@ from repositories.entities.workflow_execution import (
 )
 from repositories.sqlalchemy_api_workflow_run_repository import DifyAPISQLAlchemyWorkflowRunRepository
 from repositories.workflow_run_control import apply_workflow_stop_to_node
-from tasks.workflow_execution_tasks import _update_workflow_run_from_execution
+from services.retention.workflow_run.archive_paid_plan_workflow_run import WorkflowRunArchiver
+from services.retention.workflow_run.bundle_archive_maintenance import WorkflowRunBundleArchiveMaintenance
+from services.workflow_ref_service import WorkflowRef
+from services.workflow_service import WorkflowService
+from tasks.workflow_execution_tasks import _update_workflow_run_from_execution, save_workflow_execution_task
 
 TABLES = (WorkflowRun,)
 
@@ -54,6 +60,101 @@ def _make_account(*, tenant_id: str | None = None) -> Account:
 
 
 class TestSqlalchemyWorkflowExecutionRepositoryCases:
+    @staticmethod
+    @pytest.mark.parametrize("write_async", [False, True], ids=["sql", "celery-task"])
+    def test_published_graph_reference_preserves_snapshots(
+        sqlite_session_factory: sessionmaker[Session],
+        account: Account,
+        sample_workflow_execution: _sqlalchemy_workflow_execution_repository_WorkflowExecution,
+        write_async: bool,
+    ) -> None:
+        execution = sample_workflow_execution
+        graph = {"edges": [], "nodes": [{"id": "start", "data": {"title": "Départ"}}]}
+        with sqlite_session_factory.begin() as session:
+            published = Workflow.new(
+                tenant_id=RESOURCE_TENANT_ID,
+                app_id="app-1",
+                type=ModelWorkflowType.WORKFLOW,
+                version=execution.workflow_version,
+                graph=json.dumps(graph, ensure_ascii=False),
+                features="{}",
+                created_by=account.id,
+                environment_variables=[],
+                conversation_variables=[],
+                rag_pipeline_variables=[],
+            )
+            draft = Workflow.new(
+                tenant_id=published.tenant_id,
+                app_id=published.app_id,
+                type=published.type,
+                version=Workflow.VERSION_DRAFT,
+                graph=published.graph,
+                features="{}",
+                created_by=account.id,
+                environment_variables=[],
+                conversation_variables=[],
+                rag_pipeline_variables=[],
+            )
+            session.add_all([published, draft])
+
+        repository = SQLAlchemyWorkflowExecutionRepository(
+            session_factory=sqlite_session_factory,
+            tenant_id=published.tenant_id,
+            user=account,
+            app_id=published.app_id,
+            triggered_from=WorkflowRunTriggeredFrom.APP_RUN,
+        )
+
+        runtime_graph = {**graph, "viewport": {"zoom": 0.5}}
+        cases = [
+            ("published", published.id, published.version, graph),
+            ("changed", published.id, published.version, runtime_graph),
+            ("draft", draft.id, draft.version, graph),
+            ("different-version", published.id, "other", graph),
+            ("missing", str(uuid4()), published.version, graph),
+        ]
+        for run_id, workflow_id, version, run_graph in cases:
+            run_execution = execution.model_copy(
+                update={"id_": run_id, "workflow_id": workflow_id, "workflow_version": version, "graph": run_graph}
+            )
+            if write_async:
+                assert save_workflow_execution_task.run(
+                    execution_data=run_execution.model_dump(),
+                    tenant_id=published.tenant_id,
+                    app_id=published.app_id,
+                    triggered_from=WorkflowRunTriggeredFrom.APP_RUN.value,
+                    creator_user_id=account.id,
+                    creator_user_role=_sqlalchemy_workflow_execution_repository_CreatorUserRole.ACCOUNT.value,
+                )
+            else:
+                repository.save(run_execution)
+
+        with sqlite_session_factory() as session:
+            runs = {run.id: run for run in session.scalars(select(WorkflowRun))}
+            assert runs["published"].graph == WorkflowRun.GRAPH_FROM_WORKFLOW
+            assert runs["published"].to_dict()["graph"] == graph
+            archived = WorkflowRunArchiver._row_to_dict(runs["published"])
+            assert json.loads(archived["graph"]) == graph
+            assert WorkflowRunBundleArchiveMaintenance._row_to_dict(runs["published"]) == archived
+            draft.graph = json.dumps(runtime_graph)
+            BaseAppGenerator._restore_workflow_run_graph(session=session, workflow=draft, workflow_run_id="published")
+            assert draft.graph_dict == graph
+            for run_id, _, _, run_graph in cases[1:]:
+                assert runs[run_id].graph is not None
+                assert json.loads(runs[run_id].graph) == run_graph
+
+        with sqlite_session_factory.begin() as session:
+            WorkflowService(sqlite_session_factory).delete_workflow(
+                session=session,
+                workflow_ref=WorkflowRef(published.tenant_id, published.app_id, published.id),
+            )
+        with sqlite_session_factory() as session:
+            assert session.get(Workflow, published.id) is None
+            runs = {run.id: run for run in session.scalars(select(WorkflowRun))}
+            for run_id, _, _, run_graph in cases:
+                assert runs[run_id].graph is not None
+                assert json.loads(runs[run_id].graph) == run_graph
+
     @staticmethod
     def test_save_preserves_accumulated_duration_without_double_counting(
         sqlite_session_factory: sessionmaker[Session],

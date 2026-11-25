@@ -103,6 +103,7 @@ from models.workflow import (
     resolve_workflow_kind,
 )
 from repositories.factory import DifyAPIRepositoryFactory
+from repositories.workflow_run_graph import preserve_referenced_run_graphs
 from services.agent.retirement_service import WorkflowAgentRetirementService
 from services.app.access import AppRunAccessFilter
 from services.enterprise.enterprise_service import EnterpriseService
@@ -2353,6 +2354,7 @@ class WorkflowService:
         )
         for binding in bindings:
             session.delete(binding)
+        preserve_referenced_run_graphs(session, workflow)
         session.delete(workflow)
         return retirement_candidates
 

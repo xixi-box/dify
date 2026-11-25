@@ -21,6 +21,7 @@ from models import (
 )
 from models.enums import WorkflowRunTriggeredFrom
 from repositories.entities.workflow_execution import WorkflowExecution as TimedWorkflowExecution
+from repositories.workflow_run_graph import reference_published_graph
 
 logger = logging.getLogger(__name__)
 
@@ -197,9 +198,11 @@ class SQLAlchemyWorkflowExecutionRepository(WorkflowExecutionRepository):
         """
         # Convert domain model to database model using tenant context and other attributes
         db_model = self._to_db_model(execution)
+        inline_graph = db_model.graph
 
         # Create a new database session
         with self._session_factory() as session:
+            reference_published_graph(session, db_model)
             existing_model = session.get(WorkflowRun, db_model.id, with_for_update=True)
             if existing_model:
                 if existing_model.tenant_id != self._tenant_id:
@@ -221,7 +224,8 @@ class SQLAlchemyWorkflowExecutionRepository(WorkflowExecutionRepository):
             session.merge(db_model)
             session.commit()
 
-            # Update the in-memory cache for faster subsequent lookups
+            # Keep the transient cached model self-contained.
+            db_model.graph = inline_graph
             self._execution_cache[db_model.id] = db_model
 
     @override

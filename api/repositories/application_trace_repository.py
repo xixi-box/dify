@@ -299,7 +299,7 @@ class ApplicationTraceRepository(TraceRunRepository, TraceRunQuery, TraceSourceQ
         return SourceWorkflowRun(
             id=run.id,
             workflow_id=run.workflow_id,
-            graph=run.graph,
+            graph=run.graph_snapshot,
             status=run.status,
             finished_at=run.finished_at,
             created_by=run.created_by,

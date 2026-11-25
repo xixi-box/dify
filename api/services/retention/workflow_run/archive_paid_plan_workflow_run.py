@@ -832,9 +832,15 @@ class WorkflowRunArchiver:
         return [dict(row) for row in session.execute(stmt).mappings().all()]
 
     @staticmethod
-    def _row_to_dict(row: Any) -> dict[str, Any]:
+    def _row_to_dict(row: WorkflowRun) -> dict[str, Any]:
+        """Export a run with a self-contained graph and the existing table schema."""
         mapper = inspect(row).mapper
-        return {str(column.name): getattr(row, mapper.get_property_by_column(column).key) for column in mapper.columns}
+        record = {
+            str(column.name): getattr(row, mapper.get_property_by_column(column).key)
+            for column in row.__table__.columns
+        }
+        record["graph"] = row.graph_snapshot
+        return record
 
     def _build_archive_payload(
         self,

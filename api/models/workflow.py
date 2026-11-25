@@ -799,7 +799,7 @@ class WorkflowRun(TypeBase):
         `app-run` for (published) app execution
 
     - version (string) Version
-    - graph (text) Workflow canvas configuration (JSON)
+    - graph (text) Inline canvas JSON or a reference to the published workflow graph
     - inputs (text) Input parameters
     - status (string) Execution status, `running` / `succeeded` / `failed` / `stopped`
     - outputs (text) `optional` Output content
@@ -819,6 +819,8 @@ class WorkflowRun(TypeBase):
     """
 
     __tablename__ = "workflow_runs"
+    # Inline graphs are JSON. This reserved value points to the run's published workflow version.
+    GRAPH_FROM_WORKFLOW = "@workflow"
     __table_args__ = (
         sa.PrimaryKeyConstraint("id", name="workflow_run_pkey"),
         sa.Index("workflow_run_triggerd_from_idx", "tenant_id", "app_id", "triggered_from"),
@@ -850,6 +852,24 @@ class WorkflowRun(TypeBase):
         default_factory=lambda: str(uuid4()),
     )
     graph: Mapped[str | None] = mapped_column(LongText, default=None)
+    _published_graph: Mapped[str | None] = orm.column_property(
+        sa.case(
+            (
+                graph == GRAPH_FROM_WORKFLOW,
+                select(Workflow.graph)
+                .where(
+                    Workflow.id == workflow_id,
+                    Workflow.tenant_id == tenant_id,
+                    Workflow.app_id == app_id,
+                    Workflow.version == version,
+                    Workflow.type == type,
+                )
+                .correlate_except(Workflow)
+                .scalar_subquery(),
+            ),
+            else_=None,
+        ),
+    )
     inputs: Mapped[str | None] = mapped_column(LongText, default=None)
     outputs: Mapped[str | None] = mapped_column(LongText, default="{}")
     error: Mapped[str | None] = mapped_column(LongText, default=None)
@@ -883,8 +903,14 @@ class WorkflowRun(TypeBase):
         return session.get(EndUser, self.created_by) if created_by_role == CreatorUserRole.END_USER else None
 
     @property
+    def graph_snapshot(self) -> str | None:
+        """Return inline JSON or the canonical graph loaded with a referenced run."""
+        return self._published_graph if self.graph == self.GRAPH_FROM_WORKFLOW else self.graph
+
+    @property
     def graph_dict(self) -> Mapping[str, Any]:
-        return json.loads(self.graph) if self.graph else {}
+        graph = self.graph_snapshot
+        return json.loads(graph) if graph else {}
 
     @property
     def inputs_dict(self) -> Mapping[str, Any]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -15,7 +16,13 @@ from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from core.app.entities.app_invoke_entities import AdvancedChatAppGenerateEntity, WorkflowAppGenerateEntity
+from core.app.app_config.entities import WorkflowUIBasedAppConfig
+from core.app.entities.app_invoke_entities import (
+    AdvancedChatAppGenerateEntity,
+    InvokeFrom,
+    UserFrom,
+    WorkflowAppGenerateEntity,
+)
 from core.repositories.sqlalchemy_workflow_execution_repository import SQLAlchemyWorkflowExecutionRepository
 from core.repositories.sqlalchemy_workflow_node_execution_repository import SQLAlchemyWorkflowNodeExecutionRepository
 from core.tools.workflow_as_tool.repository import WorkflowToolSource
@@ -66,9 +73,10 @@ from graphon.nodes.start.start_node import StartNode
 from graphon.runtime import ReadOnlyRuntimeStateWrapper, RuntimeState, VariablePool
 from graphon.runtime.execution import ROOT_FRAME_ID
 from graphon.variables.variables import Variable
-from models import Account, WorkflowRun
+from models import Account, AppMode, Workflow, WorkflowRun
 from models.enums import WorkflowRunTriggeredFrom
 from models.workflow import WorkflowNodeExecutionModel, WorkflowNodeExecutionTriggeredFrom
+from models.workflow import WorkflowType as ModelWorkflowType
 from repositories.entities.workflow_execution import WorkflowExecution
 from repositories.sqlalchemy_api_workflow_node_execution_repository import (
     DifyAPISQLAlchemyWorkflowNodeExecutionRepository,
@@ -1483,3 +1491,84 @@ class TestPersistenceLayerCases:
 
             with pytest.raises(ValueError, match="workflow execution not initialized"):
                 layer._get_workflow_execution()
+
+
+def test_published_runs_share_the_canonical_graph(sqlite_session_factory: sessionmaker[Session]) -> None:
+    graph = {
+        "nodes": [{"id": "start", "data": {"type": "start", "title": "Départ", "variables": []}}],
+        "edges": [],
+    }
+    user = Account(name="Test", email="test@example.com")
+    with sqlite_session_factory.begin() as session:
+        workflow = Workflow.new(
+            tenant_id="tenant",
+            app_id="app",
+            type=ModelWorkflowType.WORKFLOW,
+            version="2026-11-25 12:00:00",
+            graph=json.dumps(graph, ensure_ascii=False),
+            features="{}",
+            created_by=user.id,
+            environment_variables=[],
+            conversation_variables=[],
+            rag_pipeline_variables=[],
+        )
+        session.add(workflow)
+
+    execution_repo = SQLAlchemyWorkflowExecutionRepository(
+        session_factory=sqlite_session_factory,
+        tenant_id=workflow.tenant_id,
+        user=user,
+        app_id=workflow.app_id,
+        triggered_from=WorkflowRunTriggeredFrom.APP_RUN,
+    )
+    node_repo = SQLAlchemyWorkflowNodeExecutionRepository(
+        session_factory=sqlite_session_factory,
+        tenant_id=workflow.tenant_id,
+        user=user,
+        app_id=workflow.app_id,
+        triggered_from=WorkflowNodeExecutionTriggeredFrom.WORKFLOW_RUN,
+    )
+    for run_id, invoke_from in (("web", InvokeFrom.WEB_APP), ("api", InvokeFrom.SERVICE_API)):
+        layer = WorkflowPersistenceLayer(
+            application_generate_entity=WorkflowAppGenerateEntity(
+                user_from=UserFrom.ACCOUNT,
+                task_id=run_id,
+                app_config=WorkflowUIBasedAppConfig(
+                    tenant_id=workflow.tenant_id,
+                    app_id=workflow.app_id,
+                    app_mode=AppMode.WORKFLOW,
+                    workflow_id=workflow.id,
+                ),
+                inputs={},
+                files=[],
+                user_id=user.id,
+                stream=False,
+                invoke_from=invoke_from,
+                workflow_execution_id=run_id,
+            ),
+            workflow_info=PersistenceWorkflowInfo(
+                workflow_id=workflow.id,
+                workflow_type=WorkflowType.WORKFLOW,
+                version=workflow.version,
+                graph_data=workflow.graph_dict,
+            ),
+            workflow_execution_repository=execution_repo,
+            workflow_node_execution_repository=node_repo,
+            trace_scope=None,
+        )
+        state = RuntimeState(
+            workflow_id=workflow.id,
+            variable_pool=VariablePool.from_bootstrap(
+                system_variables=build_system_variables(workflow_execution_id=run_id),
+            ),
+            start_at=0.0,
+        )
+        layer.initialize(ReadOnlyRuntimeStateWrapper(state), command_channel=None)
+        layer.on_event(GraphRunStartedEvent())
+
+    with sqlite_session_factory() as session:
+        runs = session.scalars(select(WorkflowRun).where(WorkflowRun.workflow_id == workflow.id)).all()
+        assert len(runs) == 2
+        assert all(run.graph_dict == graph for run in runs)
+        inline_graph_count = sum("nodes" in (run.graph or "") for run in runs)
+        assert inline_graph_count == 0

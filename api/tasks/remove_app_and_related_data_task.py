@@ -53,6 +53,7 @@ from models.workflow import (
     WorkflowArchiveLog,
 )
 from repositories.factory import DifyAPIRepositoryFactory
+from repositories.workflow_run_graph import preserve_referenced_run_graphs
 from services.api_token_service import ApiTokenCache
 from services.app_storage_cleanup_service import cleanup_app_storage
 
@@ -335,7 +336,10 @@ def _delete_app_dataset_joins(tenant_id: str, app_id: str):
 
 def _delete_app_workflows(tenant_id: str, app_id: str):
     def del_workflow(session: Session, workflow_id: str):
-        session.execute(delete(Workflow).where(Workflow.id == workflow_id).execution_options(synchronize_session=False))
+        workflow = session.get(Workflow, workflow_id, with_for_update=True)
+        if workflow is not None:
+            preserve_referenced_run_graphs(session, workflow)
+            session.delete(workflow)
 
     _delete_records(
         """select id from workflows where tenant_id=:tenant_id and app_id=:app_id limit 1000""",

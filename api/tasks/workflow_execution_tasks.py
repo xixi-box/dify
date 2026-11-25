@@ -18,6 +18,7 @@ from graphon.workflow_type_encoder import WorkflowRuntimeTypeConverter
 from models import CreatorUserRole, WorkflowRun
 from models.enums import WorkflowRunTriggeredFrom
 from repositories.entities.workflow_execution import WorkflowExecution
+from repositories.workflow_run_graph import reference_published_graph
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ def save_workflow_execution_task(
                     creator_user_id=creator_user_id,
                     creator_user_role=CreatorUserRole(creator_user_role),
                 )
+                reference_published_graph(session, workflow_run)
                 session.add(workflow_run)
                 logger.debug("Created new workflow run: %s", execution.id_)
 
