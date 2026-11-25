@@ -807,7 +807,12 @@ class DatasetRetrieval:
         metadata_filter_document_ids: dict[str, list[str]] | None = None,
         metadata_condition: MetadataFilteringCondition | None = None,
         attachment_ids: list[str] | None = None,
-    ):
+    ) -> list[Document]:
+        """Search the available datasets for the supplied text and attachments.
+
+        Raise a search error if every batch fails. A batch that completes with
+        no hits still allows the request to succeed.
+        """
         if not available_datasets:
             return []
         all_threads = []
@@ -847,6 +852,7 @@ class DatasetRetrieval:
         with measure_time() as timer:
             cancel_event = threading.Event()
             thread_exceptions: list[Exception] = []
+            failed_batches: list[Exception] = []
 
             if query:
                 query_thread = threading.Thread(
@@ -869,6 +875,7 @@ class DatasetRetrieval:
                         "dataset_count": dataset_count,
                         "cancel_event": cancel_event,
                         "thread_exceptions": thread_exceptions,
+                        "failed_batches": failed_batches,
                     },
                 )
                 all_threads.append(query_thread)
@@ -895,6 +902,7 @@ class DatasetRetrieval:
                             "dataset_count": dataset_count,
                             "cancel_event": cancel_event,
                             "thread_exceptions": thread_exceptions,
+                            "failed_batches": failed_batches,
                         },
                     )
                     all_threads.append(attachment_thread)
@@ -912,6 +920,8 @@ class DatasetRetrieval:
 
             if thread_exceptions:
                 raise thread_exceptions[0]
+            if failed_batches and len(failed_batches) == len(all_threads):
+                raise failed_batches[0]
         self._on_query(query, attachment_ids, dataset_ids, app_id, user_from, user_id)
 
         if all_documents:
@@ -1284,8 +1294,13 @@ class DatasetRetrieval:
         cancel_event: threading.Event | None,
         thread_exceptions: list[Exception] | None,
         skip_on_error: bool = False,
+        skipped_exceptions: list[Exception] | None = None,
     ) -> None:
-        """Collect errors after tracing, or skip dataset-level failures when requested."""
+        """Run a dataset worker and handle errors after tracing.
+
+        In skip mode, log a failure and record it in the supplied collector
+        without cancelling other workers.
+        """
         try:
             self._run_retriever_thread(
                 flask_app=flask_app,
@@ -1315,6 +1330,8 @@ class DatasetRetrieval:
                             "error.message": str(exc),
                         },
                     )
+                if skipped_exceptions is not None:
+                    skipped_exceptions.append(exc)
                 return
 
             if cancel_event:
@@ -1956,11 +1973,16 @@ class DatasetRetrieval:
         attachment_id: str | None,
         dataset_count: int,
         cancel_event: threading.Event | None = None,
-    ) -> None:
+    ) -> Exception | None:
+        """Search eligible datasets for one text query or attachment.
+
+        Add processed matches to all_documents. Return a search error if all
+        launched workers fail and yield no documents, or None otherwise.
+        """
         try:
             with flask_app.app_context():
                 threads = []
-                retrieval_thread_exceptions: list[Exception] = []
+                skipped_exceptions: list[Exception] = []
                 all_documents_item: list[Document] = []
                 index_type = None
                 for dataset in available_datasets:
@@ -1989,9 +2011,10 @@ class DatasetRetrieval:
                             "document_ids_filter": document_ids_filter,
                             "metadata_condition": metadata_condition,
                             "attachment_ids": [attachment_id] if attachment_id else None,
-                            "cancel_event": cancel_event,
-                            "thread_exceptions": retrieval_thread_exceptions,
+                            "cancel_event": None,
+                            "thread_exceptions": None,
                             "skip_on_error": True,
+                            "skipped_exceptions": skipped_exceptions,
                         },
                     )
                     threads.append(retrieval_thread)
@@ -2006,8 +2029,8 @@ class DatasetRetrieval:
                     if cancel_event and cancel_event.is_set():
                         break
 
-                if retrieval_thread_exceptions:
-                    raise retrieval_thread_exceptions[0]
+                if skipped_exceptions and len(skipped_exceptions) == len(threads) and not all_documents_item:
+                    return skipped_exceptions[0]
 
                 # Skip second reranking when there is only one dataset
                 if reranking_enable and dataset_count > 1:
@@ -2049,6 +2072,7 @@ class DatasetRetrieval:
                         all_documents_item = all_documents_item[:top_k] if top_k else all_documents_item
                 if all_documents_item:
                     all_documents.extend(all_documents_item)
+                return None
         except Exception:
             raise
 
@@ -2072,10 +2096,15 @@ class DatasetRetrieval:
         dataset_count: int,
         cancel_event: threading.Event | None = None,
         thread_exceptions: list[Exception] | None = None,
+        failed_batches: list[Exception] | None = None,
     ) -> None:
-        """Collect errors only after they pass through the traced multi-retrieval method."""
+        """Record batch search failures without cancelling sibling batches.
+
+        Other exceptions from the traced method trigger cancellation and are
+        recorded separately when a collector is supplied.
+        """
         try:
-            self._multiple_retrieve_thread(
+            batch_error = self._multiple_retrieve_thread(
                 flask_app=flask_app,
                 available_datasets=available_datasets,
                 metadata_condition=metadata_condition,
@@ -2093,6 +2122,8 @@ class DatasetRetrieval:
                 dataset_count=dataset_count,
                 cancel_event=cancel_event,
             )
+            if batch_error is not None and failed_batches is not None:
+                failed_batches.append(batch_error)
         except Exception as exc:
             if cancel_event:
                 cancel_event.set()

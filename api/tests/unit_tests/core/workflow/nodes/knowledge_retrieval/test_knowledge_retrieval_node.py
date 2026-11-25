@@ -3,10 +3,16 @@ import uuid
 from unittest.mock import Mock
 
 import pytest
+from flask import Flask
 from pytest_mock import MockerFixture
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
 from core.app.entities.app_invoke_entities import InvokeFrom, UserFrom
+from core.rag.datasource import retrieval_service
+from core.rag.models.document import Document
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
+from core.workflow.file_reference import build_file_reference
 from core.workflow.nodes.knowledge_retrieval.entities import (
     Condition,
     KnowledgeRetrievalNodeData,
@@ -23,10 +29,15 @@ from core.workflow.nodes.knowledge_retrieval.knowledge_retrieval_node import (
 )
 from core.workflow.nodes.knowledge_retrieval.retrieval import Source, SourceMetadata
 from core.workflow.system_variables import build_system_variables
+from extensions.ext_database import db
 from graphon.enums import WorkflowNodeExecutionStatus
+from graphon.file import File, FileTransferMethod, FileType
 from graphon.model_runtime.entities.llm_entities import LLMUsage
 from graphon.runtime import RuntimeState, VariablePool
-from graphon.variables import ArrayObjectSegment, StringSegment
+from graphon.variables import ArrayObjectSegment, FileSegment, StringSegment
+from models.dataset import Dataset
+from models.enums import IndexingStatus
+from tests.helpers.unit.model_factories import make_dataset, make_document
 from tests.workflow_test_utils import build_test_graph_init_params
 
 
@@ -114,6 +125,103 @@ class TestKnowledgeRetrievalNode:
     """
     Test suite for KnowledgeRetrievalNode.
     """
+
+    @pytest.mark.parametrize(
+        ("failed_datasets", "attachment_fails", "expected_status"),
+        [
+            pytest.param(2, None, WorkflowNodeExecutionStatus.FAILED, id="all-searches-fail"),
+            pytest.param(1, None, WorkflowNodeExecutionStatus.SUCCEEDED, id="one-search-succeeds-with-no-hits"),
+            pytest.param(0, None, WorkflowNodeExecutionStatus.SUCCEEDED, id="all-searches-succeed-with-no-hits"),
+            pytest.param(2, False, WorkflowNodeExecutionStatus.SUCCEEDED, id="attachment-searches-succeed"),
+            pytest.param(2, True, WorkflowNodeExecutionStatus.FAILED, id="text-and-attachment-searches-fail"),
+        ],
+    )
+    def test_run_with_dataset_search_outcomes(
+        self,
+        sqlite_engine: Engine,
+        sqlite_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_graph_runtime_state,
+        failed_datasets: int,
+        attachment_fails: bool | None,
+        expected_status: WorkflowNodeExecutionStatus,
+    ) -> None:
+        tenant_id = str(uuid.uuid4())
+        dataset_ids = [str(uuid.uuid4()) for _ in range(2)]
+        for dataset_id in dataset_ids:
+            dataset = make_dataset(dataset_id=dataset_id, tenant_id=tenant_id, indexing_technique="high_quality")
+            dataset.is_multimodal = attachment_fails is not None
+            sqlite_session.add(dataset)
+            document = make_document(document_id=str(uuid.uuid4()), dataset_id=dataset_id, tenant_id=tenant_id)
+            document.indexing_status = IndexingStatus.COMPLETED
+            sqlite_session.add(document)
+        sqlite_session.commit()
+        app = Flask(__name__)
+        app.config["SQLALCHEMY_DATABASE_URI"] = str(sqlite_engine.url)
+        db.init_app(app)
+
+        searched_dataset_ids: list[str] = []
+        attachment_dataset_ids: list[str] = []
+
+        class TestVector:
+            def __init__(self, *, dataset: Dataset, session: Session) -> None:
+                self.dataset_id = dataset.id
+
+            def search_by_vector(self, query: str, **kwargs: object) -> list[Document]:
+                searched_dataset_ids.append(self.dataset_id)
+                if self.dataset_id in dataset_ids[:failed_datasets]:
+                    raise RuntimeError("Vector search unavailable")
+                return []
+
+            def search_by_file(self, file_id: str, **kwargs: object) -> list[Document]:
+                attachment_dataset_ids.append(self.dataset_id)
+                if attachment_fails:
+                    raise RuntimeError("Vector search unavailable")
+                return []
+
+        monkeypatch.setattr(retrieval_service, "Vector", TestVector)
+        query_selector = ["start", "query"]
+        mock_graph_runtime_state.variable_pool.add(query_selector, StringSegment(value="What is Python?"))
+        attachment_selector = None
+        if attachment_fails is not None:
+            attachment_selector = ["start", "image"]
+            mock_graph_runtime_state.variable_pool.add(
+                attachment_selector,
+                FileSegment(
+                    value=File(
+                        type=FileType.IMAGE,
+                        transfer_method=FileTransferMethod.LOCAL_FILE,
+                        reference=build_file_reference(record_id=str(uuid.uuid4())),
+                    )
+                ),
+            )
+        node = KnowledgeRetrievalNode(
+            node_id="knowledge-retrieval",
+            data=KnowledgeRetrievalNodeData(
+                title="Knowledge Retrieval",
+                type="knowledge-retrieval",
+                dataset_ids=dataset_ids,
+                query_variable_selector=query_selector,
+                query_attachment_selector=attachment_selector,
+                retrieval_mode="multiple",
+                multiple_retrieval_config=MultipleRetrievalConfig(top_k=5, reranking_enable=False),
+            ),
+            init_params=build_test_graph_init_params(tenant_id=tenant_id),
+            runtime_state=mock_graph_runtime_state,
+        )
+
+        with app.app_context():
+            result = node._run()
+            db.engine.dispose()
+
+        assert sorted(searched_dataset_ids) == sorted(dataset_ids)
+        if attachment_fails is not None:
+            assert sorted(attachment_dataset_ids) == sorted(dataset_ids)
+        assert result.status == expected_status
+        if expected_status == WorkflowNodeExecutionStatus.FAILED:
+            assert result.error == "Vector search unavailable"
+        else:
+            assert result.outputs["result"] == ArrayObjectSegment(value=[])
 
     def test_run_with_no_query_or_attachment(
         self,
