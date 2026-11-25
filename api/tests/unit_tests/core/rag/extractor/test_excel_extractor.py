@@ -29,6 +29,8 @@ class _FakeCell:
 
 
 class _FakeSheet:
+    title: str
+
     def __init__(self, header_rows, data_rows, images=None):
         self._header_rows = header_rows
         self._data_rows = data_rows
@@ -50,12 +52,10 @@ class _FakeSheet:
 
 class _FakeWorkbook:
     def __init__(self, sheets):
-        self._sheets = sheets
-        self.sheetnames = list(sheets.keys())
+        self.worksheets = list(sheets.values())
+        for title, sheet in sheets.items():
+            sheet.title = title
         self.closed = False
-
-    def __getitem__(self, key):
-        return self._sheets[key]
 
     def close(self):
         self.closed = True

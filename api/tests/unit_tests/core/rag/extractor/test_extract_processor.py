@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
 from sqlalchemy.orm import Session
 
 import core.rag.extractor.extract_processor as processor_module
@@ -12,6 +14,7 @@ from core.rag.extractor.entity.datasource_type import DatasourceType
 from core.rag.extractor.entity.extract_setting import ExtractSetting, NotionInfo, WebsiteInfo
 from core.rag.extractor.extract_processor import ExtractProcessor
 from core.rag.models.document import Document
+from extensions.storage.opendal_storage import OpenDALStorage
 from models.model import UploadFile
 from tests.helpers.unit.config_override import apply_config_overrides
 from tests.helpers.unit.model_factories import make_upload_file
@@ -306,6 +309,38 @@ class TestExtractProcessorFileRouting:
         extractor_name, _, _ = self._run_extract_for_extension(monkeypatch, extension, etl_type="SelfHosted")
 
         assert extractor_name == expected_extractor
+
+    @pytest.mark.parametrize("chart_location", ["chart-sheet", "embedded", "none"])
+    def test_extract_xlsx_preserves_worksheet_rows_with_charts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chart_location: str
+    ) -> None:
+        """Import exactly the data rows from a stored XLSX with each chart layout."""
+        workbook = Workbook()
+        sales = workbook.create_sheet("Sales")
+        workbook.remove(workbook["Sheet"])
+        sales.append(["Month", "Amount"])
+        sales.append(["January", 125])
+        sales.append(["February", 180])
+        if chart_location != "none":
+            chart = BarChart()
+            chart.add_data(Reference(sales, min_col=2, min_row=1, max_row=3), titles_from_data=True)
+            if chart_location == "chart-sheet":
+                workbook.create_chartsheet("Sales Chart").add_chart(chart)
+            else:
+                sales.add_chart(chart, "D1")
+
+        upload = _upload_file(key="sales.xlsx")
+        workbook.save(tmp_path / upload.key)
+        local_storage = OpenDALStorage(scheme="fs", root=str(tmp_path))
+        monkeypatch.setattr(processor_module.storage, "storage_runner", local_storage, raising=False)
+        apply_config_overrides(monkeypatch, ETL_TYPE="dify")
+
+        docs = ExtractProcessor.load_from_upload_file(upload)
+
+        assert [doc.page_content for doc in docs] == [
+            '"Month":"January";"Amount":"125"',
+            '"Month":"February";"Amount":"180"',
+        ]
 
     def test_extract_routes_excel_with_upload_context(self, monkeypatch: pytest.MonkeyPatch):
         extractor_name, args, kwargs = self._run_extract_for_extension(monkeypatch, ".xlsx", etl_type="SelfHosted")

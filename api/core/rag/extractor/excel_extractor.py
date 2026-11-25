@@ -76,7 +76,10 @@ class ExcelExtractor(BaseExtractor):
 
     @override
     def extract(self) -> list[Document]:
-        """Load from Excel file in xls or xlsx format using Pandas and openpyxl."""
+        """Read an .xls or .xlsx file and return documents for its worksheet data rows.
+
+        Skip chart sheets in .xlsx workbooks. File and parsing errors propagate to the caller.
+        """
         documents = []
         file_extension = os.path.splitext(self._file_path)[-1].lower()
 
@@ -84,14 +87,13 @@ class ExcelExtractor(BaseExtractor):
             # Worksheet drawing objects, including embedded images, are not available in read-only mode.
             wb = load_workbook(self._file_path, data_only=True)
             try:
-                for sheet_name in wb.sheetnames:
-                    sheet = wb[sheet_name]
+                for sheet in wb.worksheets:
                     header_row_idx, column_map, max_col_idx = self._find_header_and_columns(sheet)
                     if not column_map:
                         continue
                     start_row = header_row_idx + 1
                     sheet_image_map = self._extract_images_from_sheet(
-                        sheet_name=sheet_name,
+                        sheet_name=sheet.title,
                         sheet=sheet,
                         valid_columns={column_idx + 1 for column_idx in column_map},
                         min_row=start_row,
