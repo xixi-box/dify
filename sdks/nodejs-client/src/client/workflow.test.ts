@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test'
-import { createHttpClientWithSpies } from '../../tests/test-utils'
+import { createHttpClient, createHttpClientWithSpies } from '../../tests/test-utils'
 import { WorkflowClient } from './workflow'
 
 describe('WorkflowClient', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   it('runs workflows with blocking and streaming modes', async () => {
@@ -67,6 +68,51 @@ describe('WorkflowClient', () => {
       },
     })
   })
+
+  it.each([
+    ['run', 'blocking', '/workflows/run'],
+    ['run', 'streaming', '/workflows/run'],
+    ['runById', 'blocking', '/workflows/wf/run'],
+    ['runById', 'streaming', '/workflows/wf/run'],
+  ] as const)(
+    'serializes omitted workflow inputs as an empty object for %s in %s mode',
+    async (method, responseMode, path) => {
+      const { client, fetchMock } = createHttpClient({ baseUrl: 'https://example.com/v1' })
+      const workflow = new WorkflowClient(client)
+      const streaming = responseMode === 'streaming'
+      fetchMock.mockImplementation(async () =>
+        streaming
+          ? new Response('data: {"event":"workflow_finished"}\n\n', {
+              headers: { 'content-type': 'text/event-stream' },
+            })
+          : Response.json({}),
+      )
+      const payload = { user: 'user', response_mode: responseMode, files: null }
+      const inputs = { input: 'x' }
+      const payloadWithInputs = { ...payload, inputs }
+
+      for (const request of [payload, payload, payloadWithInputs]) {
+        const result =
+          method === 'run' ? await workflow.run(request) : await workflow.runById('wf', request)
+        expect(Symbol.asyncIterator in result).toBe(streaming)
+      }
+
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+      const bodies = fetchMock.mock.calls.map(([url, init]) => {
+        expect(url).toBe(`https://example.com/v1${path}`)
+        expect(init.method).toBe('POST')
+        return JSON.parse(init.body)
+      })
+      const expectedPayload = { user: 'user', response_mode: responseMode, files: null }
+      expect(bodies).toEqual([
+        { ...expectedPayload, inputs: {} },
+        { ...expectedPayload, inputs: {} },
+        { ...expectedPayload, inputs: { input: 'x' } },
+      ])
+      expect(payload).toStrictEqual(expectedPayload)
+      expect(payloadWithInputs).toStrictEqual({ ...expectedPayload, inputs: { input: 'x' } })
+    },
+  )
 
   it('gets run details and stops workflow', async () => {
     const { client, request } = createHttpClientWithSpies()
