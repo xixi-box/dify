@@ -107,11 +107,35 @@ class RetrievalService:
         document_ids_filter: list[str] | None = None,
         attachment_ids: list[str] | None = None,
     ):
+        """Retrieve ranked matches for a dataset ID and a text query or attachments.
+
+        Return an empty list if no input or dataset is found. Weighted hybrid scoring uses
+        the dataset's configured embedding provider and model when both are present, without
+        modifying the caller's retrieval weights. Errors reported by search branches propagate.
+        """
         if not query and not attachment_ids:
             return []
         dataset = cls._get_dataset(dataset_id)
         if not dataset:
             return []
+
+        if (
+            retrieval_method == RetrievalMethod.HYBRID_SEARCH
+            and reranking_mode == RerankMode.WEIGHTED_SCORE
+            and weights
+            and (vector_setting := weights.get("vector_setting"))
+            and dataset.embedding_model_provider
+            and dataset.embedding_model
+        ):
+            # Unscored full-text hits must be compared in the embedding space of the index.
+            weights = {
+                **weights,
+                "vector_setting": {
+                    **vector_setting,
+                    "embedding_provider_name": dataset.embedding_model_provider,
+                    "embedding_model_name": dataset.embedding_model,
+                },
+            }
 
         all_documents: list[Document] = []
         exceptions: list[str] = []

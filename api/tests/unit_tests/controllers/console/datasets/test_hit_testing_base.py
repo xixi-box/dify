@@ -1,6 +1,17 @@
+import base64
+from collections.abc import Callable
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
+import numpy as np
 import pytest
+import weaviate
+from dify_vdb_weaviate.weaviate_vector import WeaviateVector
+from flask import Flask
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
+from weaviate.collections.classes.internal import MetadataReturn, Object, QueryReturn
+from weaviate.connect import ConnectionParams
 from werkzeug.exceptions import Forbidden, InternalServerError, NotFound
 
 import services.errors.base
@@ -20,9 +31,14 @@ from core.errors.error import (
     ProviderTokenNotInitError,
     QuotaExceededError,
 )
+from core.rag.embedding import cached_embedding
+from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
 from graphon.model_runtime.errors.invoke import InvokeError
+from libs.helper import generate_text_hash
 from models.account import Account, Tenant, TenantAccountRole
-from models.dataset import Dataset
+from models.dataset import Dataset, Document, DocumentSegment
+from models.engine import db
+from models.enums import DataSourceType, DocumentCreatedFrom, SegmentStatus
 from services.hit_testing_service import HitTestingService
 from services.knowledge.dataset_service import DatasetService
 
@@ -41,6 +57,144 @@ def account() -> Account:
 @pytest.fixture
 def dataset() -> Dataset:
     return Dataset(id="dataset-1", tenant_id="tenant-1", name="Dataset", created_by="account-1")
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        ("langgenius/ollama/ollama", "qwen3-embedding"),
+        ("", ""),
+        ("langgenius/ollama/ollama", "embeddinggemma:2-740m"),
+    ],
+    ids=["stale-model", "empty-fields", "matching-model"],
+)
+def test_weighted_hybrid_uses_knowledge_base_embedding(
+    provider: str,
+    model: str,
+    account: Account,
+    sqlite_engine: Engine,
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    config_overrides: Callable[..., None],
+) -> None:
+    """Check both search branches and their fused scores for a configured knowledge base."""
+    query = "embedding"
+    ollama = "langgenius/ollama/ollama"
+    embedding_model = "embeddinggemma:2-740m"
+    dataset = Dataset(
+        id=str(uuid4()),
+        tenant_id="tenant-1",
+        name="EmbeddingGemma knowledge base",
+        created_by=account.id,
+        indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+        embedding_model_provider=ollama,
+        embedding_model=embedding_model,
+    )
+    document = Document(
+        id=str(uuid4()),
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        position=1,
+        data_source_type=DataSourceType.UPLOAD_FILE,
+        batch="batch",
+        name="Reference",
+        doc_form=IndexStructureType.PARAGRAPH_INDEX,
+        created_from=DocumentCreatedFrom.API,
+        created_by=account.id,
+    )
+    semantic, lexical = [
+        DocumentSegment(
+            tenant_id=dataset.tenant_id,
+            dataset_id=dataset.id,
+            document_id=document.id,
+            index_node_id=str(uuid4()),
+            position=position,
+            content=content,
+            word_count=1,
+            tokens=1,
+            status=SegmentStatus.COMPLETED,
+            created_by=account.id,
+        )
+        for position, content in enumerate(("reference", query), start=1)
+    ]
+    sqlite_session.add_all([dataset, document, semantic, lexical])
+    sqlite_session.commit()
+
+    app = Flask(__name__)
+    app.config["SQLALCHEMY_DATABASE_URI"] = sqlite_engine.url
+    db.init_app(app)
+    endpoint = "http://localhost:8080"
+    config_overrides(VECTOR_STORE="weaviate", WEAVIATE_ENDPOINT=endpoint)
+    client = weaviate.WeaviateClient(ConnectionParams.from_url(endpoint, grpc_port=50051))
+    collection_name = Dataset.gen_collection_name_by_id(dataset.id)
+    collection = client.collections.use(collection_name)
+    monkeypatch.setattr(WeaviateVector, "_init_client", lambda _self, _config: client)
+    monkeypatch.setattr(client.collections, "exists", lambda name: name == collection_name)
+    monkeypatch.setattr(client.collections, "use", lambda _name: collection)
+
+    def hit(
+        segment: DocumentSegment, metadata: MetadataReturn, vector: dict[str, list[float] | list[list[float]]]
+    ) -> Object[dict[str, str | None], None]:
+        return Object(
+            uuid=uuid4(),
+            metadata=metadata,
+            properties={"text": segment.content, "doc_id": segment.index_node_id, "document_id": document.id},
+            references=None,
+            vector=vector,
+            collection=collection_name,
+        )
+
+    def near_vector(*, near_vector: list[float], **_kwargs: object) -> QueryReturn[dict[str, str | None], None]:
+        assert near_vector == [1.0, 0.0]
+        return QueryReturn(objects=[hit(semantic, MetadataReturn(distance=0.2), {})])
+
+    monkeypatch.setattr(collection.query, "near_vector", near_vector)
+    monkeypatch.setattr(
+        collection.query,
+        "bm25",
+        lambda **_kwargs: QueryReturn(objects=[hit(lexical, MetadataReturn(), {"default": [1.0, 0.0]})]),
+    )
+    query_hash = generate_text_hash(query)
+    embeddings = {
+        f"{ollama}_{embedding_model}_{query_hash}": base64.b64encode(np.array([1.0, 0.0]).tobytes()),
+        f"{ollama}_qwen3-embedding_{query_hash}": base64.b64encode(np.array([1.0, 0.0, 0.0]).tobytes()),
+    }
+    monkeypatch.setattr(cached_embedding.redis_client, "get", embeddings.get)
+
+    def parse_args(search_method: str) -> dict[str, object]:
+        return DatasetsHitTestingBase.parse_args(
+            {
+                "query": query,
+                "retrieval_model": {
+                    "search_method": search_method,
+                    "reranking_mode": "weighted_score",
+                    "reranking_enable": False,
+                    "top_k": 4,
+                    "score_threshold_enabled": False,
+                    "weights": {
+                        "vector_setting": {
+                            "vector_weight": 0.75,
+                            "embedding_provider_name": provider,
+                            "embedding_model_name": model,
+                        },
+                        "keyword_setting": {"keyword_weight": 0.25},
+                    },
+                },
+            }
+        )
+
+    def scores(args: dict[str, object]) -> dict[str, float]:
+        response = DatasetsHitTestingBase.perform_hit_testing(sqlite_session, dataset, args, account, dataset.tenant_id)
+        return {record["segment"]["id"]: record["score"] for record in response["records"]}
+
+    hybrid_args = parse_args("hybrid_search")
+    with app.app_context():
+        assert scores(parse_args("semantic_search")) == {semantic.id: pytest.approx(0.8)}
+        assert scores(parse_args("full_text_search")) == {lexical.id: 0.0}
+        assert scores(hybrid_args) == {semantic.id: pytest.approx(0.6), lexical.id: pytest.approx(1.0)}
+        assert scores(hybrid_args) == {semantic.id: pytest.approx(0.6), lexical.id: pytest.approx(1.0)}
+
+    assert hybrid_args == parse_args("hybrid_search")
 
 
 def hit_testing_record() -> dict[str, object]:
