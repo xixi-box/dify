@@ -33,6 +33,7 @@ class AgentToolInvokeTarget(BaseModel):
     `runtime_parameters` are API-prepared hidden/form/runtime values forwarded
     into `ToolManager` runtime construction. `tool_parameters` are the live
     LLM/user invocation arguments supplied at call time.
+    `mcp_request_headers_token` is the optional API-issued caller header snapshot.
     """
 
     provider_type: AgentToolProviderType
@@ -41,6 +42,7 @@ class AgentToolInvokeTarget(BaseModel):
     credential_id: str | None = None
     tool_parameters: dict[str, JsonValue] = Field(default_factory=dict)
     runtime_parameters: dict[str, JsonValue] = Field(default_factory=dict)
+    mcp_request_headers_token: str | None = Field(default=None, repr=False, exclude_if=lambda value: value is None)
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 

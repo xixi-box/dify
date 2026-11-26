@@ -1,17 +1,36 @@
 """Unit tests for the Agent tool inner invoke service."""
 
+import asyncio
 import json
 import sqlite3
 from collections.abc import Generator
 from dataclasses import dataclass, field
-from unittest.mock import patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
+import httpx
 import pytest
+from Crypto.PublicKey import RSA
+from dify_agent.layers.dify_core_tools import DifyCoreToolsLayerConfig
+from dify_agent.layers.dify_core_tools.client import DifyCoreToolsClient
+from dify_agent.layers.execution_context import DifyExecutionContextLayerConfig
+from dify_agent.protocol import CreateRunRequest
+from flask import Flask
 from sqlalchemy import Connection, Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 import core.db.session_factory as session_factory_module
+from clients.agent_backend import (
+    DIFY_CORE_TOOLS_LAYER_ID,
+    DIFY_EXECUTION_CONTEXT_LAYER_ID,
+    AgentBackendAgentAppRunInput,
+    AgentBackendModelConfig,
+    AgentBackendRunRequestBuilder,
+    AgentBackendWorkflowNodeRunInput,
+)
+from controllers.inner_api import bp as inner_api_bp
 from core.app.entities.app_invoke_entities import InvokeFrom, UserFrom
+from core.helper import encrypter
+from core.mcp.types import CallToolResult, TextContent
 from core.tools.__base.tool_runtime import ToolRuntime
 from core.tools.entities.tool_entities import ToolInvokeFrom, ToolInvokeMessage, ToolProviderType
 from core.tools.errors import (
@@ -20,13 +39,21 @@ from core.tools.errors import (
     ToolProviderCredentialValidationError,
     ToolProviderNotFoundError,
 )
+from core.tools.mcp_tool.provider import MCPToolProviderController
 from core.workflow.file_reference import build_file_reference, is_canonical_file_reference, resolve_file_record_id
+from core.workflow.nodes.agent_v2.dify_tools_builder import WorkflowAgentDifyToolsBuilder
+from extensions.ext_database import db
 from graphon.file import File, FileTransferMethod, FileType
+from libs import rsa
+from libs.key_providers.rsa_key_provider import RSAKeyProvider
 from models import ToolFile
+from models.agent_config_entities import AgentSoulToolsConfig
 from models.model import App, AppMode
 from services.agent_tool_inner_service import AgentToolInnerService
 from services.entities.agent_tool_inner import AgentToolInvokeRequest
 from services.errors.agent_tool_inner import AgentToolInnerServiceError
+from tests.helpers.unit.config_override import config_overrides_context
+from tests.helpers.unit.core.mcp.fixtures import make_provider
 
 
 def _request() -> AgentToolInvokeRequest:
@@ -100,6 +127,155 @@ def _invoke_observation(session: Session, messages: list[ToolInvokeMessage]) -> 
         ),
     ):
         return AgentToolInnerService().invoke(_request(), session=session).observation
+
+
+def test_agent_v2_resolves_mcp_headers_from_original_request(app: Flask, sqlite_session: Session) -> None:
+    _persist_app(sqlite_session)
+    inner_app = Flask(__name__)
+    inner_app.config["TESTING"] = True
+    inner_app.register_blueprint(inner_api_bp)
+    private_key = RSA.generate(2048)
+    public_key = private_key.public_key().export_key()
+    provider = make_provider({})
+    provider.tenant_id = "tenant-1"
+    provider.icon = "icon.svg"
+    provider.tools = [{"name": "search", "inputSchema": {"type": "object"}}]
+    header_templates = {
+        "Authorization": "Bearer {{request.headers.x-caller-token}}",
+        "X-Combined": "{{ request.header.X-Region }} / {{request.headers.X-Missing}}",
+        "X-Static": "static-value",
+        "X-Internal": "{{request.headers.X-Inner-Api-Key}}",
+    }
+    tools = AgentSoulToolsConfig.model_validate(
+        {
+            "dify_tools": [
+                {
+                    "provider_type": "mcp",
+                    "provider_id": "test-server",
+                    "tool_name": "search",
+                    "credential_type": "unauthorized",
+                }
+            ]
+        }
+    )
+    outbound_headers: list[dict[str, str]] = []
+
+    def capture_mcp_transport(**kwargs):
+        outbound_headers.append(kwargs["headers"].copy())
+        return transport
+
+    def invoke_inner(request: httpx.Request) -> httpx.Response:
+        response = inner_app.test_client().open(
+            request.url.path, method=request.method, headers=dict(request.headers), data=request.content
+        )
+        return httpx.Response(response.status_code, content=response.data)
+
+    async def invoke_core_tool(
+        config: DifyCoreToolsLayerConfig, execution_context: DifyExecutionContextLayerConfig
+    ) -> str:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(invoke_inner)) as http_client:
+            client = DifyCoreToolsClient(base_url="http://api", api_key="inner-only-value", http_client=http_client)
+            response = await client.invoke(
+                execution_context=execution_context, tool_config=config.tools[0], tool_parameters={}
+            )
+        return response.observation
+
+    transport = MagicMock()
+    transport.__enter__.return_value = (MagicMock(), MagicMock(), MagicMock())
+    with (
+        config_overrides_context(PLUGIN_DAEMON_KEY="plugin-daemon-key", INNER_API_KEY_FOR_PLUGIN="inner-only-value"),
+        patch.object(type(db), "engine", new_callable=PropertyMock, return_value=sqlite_session.get_bind()),
+        patch.object(RSAKeyProvider, "encrypt", side_effect=lambda _, value: rsa.encrypt(value, public_key)),
+        patch.object(
+            rsa, "get_decrypt_decoding", return_value=(private_key, rsa.gmpy2_pkcs10aep_cipher.new(private_key))
+        ),
+        patch("core.tools.tool_manager.ToolManager.get_mcp_provider_controller") as get_controller,
+        patch(
+            "services.tools.mcp_tools_manage_service.MCPToolManageService.get_provider_entity_by_persisted_reference",
+            return_value=provider,
+        ),
+        patch(
+            "services.tools.mcp_tools_manage_service.MCPToolManageService.get_provider_entity_by_server_identifier",
+            return_value=provider,
+        ),
+        patch("core.mcp.mcp_client.streamablehttp_client", side_effect=capture_mcp_transport),
+        patch("core.mcp.mcp_client.ClientSession") as mcp_session,
+    ):
+        provider.server_url = encrypter.encrypt_token(provider.tenant_id, "https://mcp.example.test/mcp")
+        provider.headers = {
+            key: encrypter.encrypt_token(provider.tenant_id, value) for key, value in header_templates.items()
+        }
+        get_controller.return_value = MCPToolProviderController.from_entity(provider)
+        mcp_session.return_value.__enter__.return_value.call_tool.return_value = CallToolResult(
+            content=[TextContent(type="text", text="ok")]
+        )
+        for request_headers, is_workflow in (
+            ({"X-Caller-Token": "first-caller", "X-Region": "eu", "X-Unrelated": "unrelated-value"}, False),
+            ({"X-Caller-Token": "{{request.header.X-Region}}", "X-Region": "us"}, True),
+            ({}, False),
+        ):
+            with app.test_request_context(headers=request_headers):
+                prepared = WorkflowAgentDifyToolsBuilder().build_layers(
+                    tenant_id="tenant-1",
+                    app_id="app-1",
+                    user_id="user-1",
+                    tools=tools,
+                    invoke_from=InvokeFrom.SERVICE_API,
+                )
+            execution_context = DifyExecutionContextLayerConfig(
+                tenant_id="tenant-1",
+                user_id="user-1",
+                user_from="end-user",
+                app_id="app-1",
+                agent_mode="workflow_run" if is_workflow else "agent_app",
+                workflow_id="workflow-1" if is_workflow else None,
+                invoke_from="service-api",
+            )
+            model = AgentBackendModelConfig(plugin_id="langgenius/openai", model_provider="openai", model="gpt-test")
+            builder = AgentBackendRunRequestBuilder()
+            if is_workflow:
+                run_request = builder.build_for_workflow_node(
+                    AgentBackendWorkflowNodeRunInput(
+                        model=model,
+                        execution_context=execution_context,
+                        backend_binding_ref="binding-ref",
+                        user_prompt="Search.",
+                        workflow_node_job_prompt="Run the search.",
+                        core_tools=prepared.core_tools,
+                    )
+                )
+            else:
+                run_request = builder.build_for_agent_app(
+                    AgentBackendAgentAppRunInput(
+                        model=model,
+                        execution_context=execution_context,
+                        backend_binding_ref="binding-ref",
+                        user_prompt="Search.",
+                        core_tools=prepared.core_tools,
+                    )
+                )
+            serialized_run = run_request.model_dump_json()
+            assert "first-caller" not in serialized_run
+            assert "unrelated-value" not in serialized_run
+            parsed_run = CreateRunRequest.model_validate_json(serialized_run)
+            layers = {layer.name: layer.config for layer in parsed_run.composition.layers}
+            assert "ok" in asyncio.run(
+                invoke_core_tool(
+                    DifyCoreToolsLayerConfig.model_validate(layers[DIFY_CORE_TOOLS_LAYER_ID]),
+                    DifyExecutionContextLayerConfig.model_validate(layers[DIFY_EXECUTION_CONTEXT_LAYER_ID]),
+                )
+            )
+
+    assert outbound_headers == [
+        {"Authorization": "Bearer first-caller", "X-Combined": "eu / ", "X-Static": "static-value", "X-Internal": ""},
+        {
+            "Authorization": "Bearer {{request.header.X-Region}}",
+            "X-Combined": "us / ",
+            "X-Static": "static-value",
+            "X-Internal": "",
+        },
+        {"Authorization": "Bearer ", "X-Combined": " / ", "X-Static": "static-value", "X-Internal": ""},
+    ]
 
 
 @pytest.mark.parametrize("message_type", ["image_link", "binary_link", "link"])

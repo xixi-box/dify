@@ -39,6 +39,7 @@ from core.tools.errors import (
     ToolProviderCredentialValidationError,
     ToolProviderNotFoundError,
 )
+from core.tools.mcp_tool.tool import MCPTool
 from core.tools.tool_engine import ToolEngine
 from core.tools.tool_manager import ToolManager
 from core.tools.utils.message_transformer import ToolFileMessageTransformer
@@ -70,8 +71,9 @@ class AgentToolInnerService:
     def invoke(self, request: AgentToolInvokeRequest, *, session: Session) -> AgentToolInvokeResponse:
         """Execute a validated Agent tool request and return serialized messages plus a model observation.
 
-        Validates ``App`` tenant ownership on ``session``, invokes the tool and
-        ``ToolFileMessageTransformer``, and reads any persisted ``ToolFile``
+        Validates ``App`` tenant ownership on ``session`` and binds the original
+        caller's header source before invoking an MCP tool. Transforms messages
+        with ``ToolFileMessageTransformer`` and reads any persisted ``ToolFile``
         metadata through ``self._session_factory`` after transformation without
         altering ``session``'s caller-owned transaction lifecycle.
         """
@@ -116,6 +118,8 @@ class AgentToolInnerService:
                 allow_file_parameters=True,
                 use_default_for_missing_form_parameters=True,
             )
+            if isinstance(tool_runtime, MCPTool):
+                tool_runtime.bind_request_headers_token(request.tool.mcp_request_headers_token)
             tool_runtime.runtime.dify_run_context = dify_run_context
             tool_runtime.runtime.tool_invoke_from = (
                 ToolInvokeFrom.WORKFLOW if request.caller.workflow_id is not None else ToolInvokeFrom.AGENT

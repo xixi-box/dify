@@ -296,6 +296,11 @@ class MCPProviderEntity(BaseModel):
 
     def _decrypt_dict(self, data: dict[str, Any]) -> dict[str, Any]:
         """Generic method to decrypt dictionary fields"""
+        return self.decrypt_provider_fields(self.tenant_id, data)
+
+    @staticmethod
+    def decrypt_provider_fields(tenant_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Decrypt encrypted string fields for their owning tenant, retaining other fields."""
         from core.tools.utils.encryption import create_provider_encrypter
 
         if not data:
@@ -319,7 +324,7 @@ class MCPProviderEntity(BaseModel):
         config = [BasicProviderConfig(type=ProviderConfigType.SECRET_INPUT, name=key) for key in encrypted_fields]
 
         encrypter_instance, _ = create_provider_encrypter(
-            tenant_id=self.tenant_id,
+            tenant_id=tenant_id,
             config=config,
             cache=NoOpProviderCredentialCache(),
         )

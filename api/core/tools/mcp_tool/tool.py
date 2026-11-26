@@ -7,12 +7,17 @@ from collections.abc import Generator, Mapping
 from copy import deepcopy
 from typing import Any, cast, override
 
+from flask import has_request_context, request
+from pydantic import ConfigDict, TypeAdapter
 from sqlalchemy.orm import Session
+from werkzeug.datastructures import Headers
 
 from configs import dify_config
-from core.entities.mcp_provider import IdentityMode
+from core.entities.mcp_provider import IdentityMode, MCPProviderEntity
+from core.helper import encrypter
 from core.mcp.auth_client import MCPClientWithAuthRetry
 from core.mcp.error import MCPConnectionError
+from core.mcp.mcp_client import referenced_request_headers
 from core.mcp.types import (
     AudioContent,
     BlobResourceContents,
@@ -30,6 +35,7 @@ from enums import DeploymentEdition
 from graphon.model_runtime.entities.llm_entities import LLMUsage, LLMUsageMetadata
 
 logger = logging.getLogger(__name__)
+_REQUEST_HEADERS = TypeAdapter(dict[str, str], config=ConfigDict(hide_input_in_errors=True))
 
 # Custom header used to carry the forwarded SSO access token. Picked to avoid
 # stomping on the workspace-scoped Authorization header (provider OAuth /
@@ -67,6 +73,8 @@ class MCPTool(Tool):
         timeout: float | None = None,
         sse_read_timeout: float | None = None,
         identity_mode: IdentityMode = IdentityMode.OFF,
+        *,
+        request_headers: Headers | None = None,
     ):
         super().__init__(entity, runtime)
         self.tenant_id = tenant_id
@@ -77,7 +85,29 @@ class MCPTool(Tool):
         self.timeout = timeout
         self.sse_read_timeout = sse_read_timeout
         self.identity_mode: IdentityMode = identity_mode
+        self._request_headers = request_headers
         self._latest_usage = LLMUsage.empty_usage()
+
+    def capture_request_headers_token(self) -> str | None:
+        """Seal caller values referenced by this tenant's MCP templates for Agent dispatch.
+
+        Without a Flask request or matching headers there is nothing to carry.
+        The stored templates and the current request remain untouched.
+        """
+        if not self.headers or not has_request_context():
+            return None
+        templates = MCPProviderEntity.decrypt_provider_fields(self.tenant_id, self.headers)
+        values = referenced_request_headers(templates, request.headers)
+        return encrypter.encrypt_token(self.tenant_id, _REQUEST_HEADERS.dump_json(values).decode()) if values else None
+
+    def bind_request_headers_token(self, token: str | None) -> None:
+        """Use the same-tenant Agent request snapshot for this runtime instance.
+
+        An omitted snapshot binds an empty source so inner transport headers
+        cannot satisfy provider templates. An invalid snapshot fails invocation.
+        """
+        values = _REQUEST_HEADERS.validate_json(encrypter.decrypt_token(self.tenant_id, token)) if token else {}
+        self._request_headers = Headers(values)
 
     @override
     def tool_provider_type(self) -> ToolProviderType:
@@ -273,6 +303,7 @@ class MCPTool(Tool):
             timeout=self.timeout,
             sse_read_timeout=self.sse_read_timeout,
             identity_mode=self.identity_mode,
+            request_headers=self._request_headers,
         )
 
     @override
@@ -365,6 +396,7 @@ class MCPTool(Tool):
                 sse_read_timeout=self.sse_read_timeout,
                 provider_entity=provider_entity,
                 forward_identity_active=forward_identity_active,
+                request_headers=self._request_headers,
             ) as mcp_client:
                 return mcp_client.invoke_tool(tool_name=self.entity.identity.name, tool_args=tool_parameters)
         except MCPConnectionError as e:

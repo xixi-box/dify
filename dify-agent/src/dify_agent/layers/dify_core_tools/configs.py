@@ -23,7 +23,7 @@ def _default_parameters_json_schema() -> dict[str, JsonValue]:
 
 
 class DifyCoreToolConfig(BaseModel):
-    """Prepared API-routed tool declaration exposed to the model."""
+    """Prepared API-routed tool declaration with an optional opaque MCP callback token."""
 
     provider_type: DifyCoreToolProviderType
     provider_id: str
@@ -34,6 +34,7 @@ class DifyCoreToolConfig(BaseModel):
     runtime_parameters: dict[str, JsonValue] = Field(default_factory=dict)
     parameters: list[DifyPluginToolParameter] = Field(default_factory=list)
     parameters_json_schema: dict[str, JsonValue] = Field(default_factory=_default_parameters_json_schema)
+    mcp_request_headers_token: str | None = Field(default=None, repr=False, exclude_if=lambda value: value is None)
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 

@@ -22,6 +22,7 @@ from core.plugin.provider_identity import normalize_plugin_daemon_provider_ident
 from core.tools.__base.tool import Tool
 from core.tools.entities.tool_entities import ToolProviderType
 from core.tools.errors import ToolProviderCredentialValidationError, ToolProviderNotFoundError
+from core.tools.mcp_tool.tool import MCPTool
 from core.tools.plugin_tool.tool import PluginTool
 from core.tools.tool_manager import ToolManager
 from core.tools.workflow_as_tool.provider import WorkflowToolProviderController
@@ -470,6 +471,7 @@ class WorkflowAgentDifyToolsBuilder:
         exposed_name: str,
         description: str | None = None,
     ) -> DifyCoreToolConfig:
+        """Serialize the prepared tool and any caller headers required by its MCP templates."""
         parameters = self._prepared_parameters(tool_runtime)
         return DifyCoreToolConfig(
             provider_type=_CORE_TOOL_PROVIDER_TYPES[tool_config.provider_type],
@@ -481,6 +483,9 @@ class WorkflowAgentDifyToolsBuilder:
             runtime_parameters=self._runtime_parameters(tool_runtime, parameters),
             parameters=parameters,
             parameters_json_schema=tool_runtime.get_llm_parameters_json_schema(),
+            mcp_request_headers_token=(
+                tool_runtime.capture_request_headers_token() if isinstance(tool_runtime, MCPTool) else None
+            ),
         )
 
     @staticmethod

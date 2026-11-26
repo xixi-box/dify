@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import Any, override
 
 from sqlalchemy.orm import Session
+from werkzeug.datastructures import Headers
 
 from core.entities.mcp_provider import MCPProviderEntity
 from core.mcp.error import MCPAuthError
@@ -40,6 +41,8 @@ class MCPClientWithAuthRetry(MCPClient):
         provider_entity: MCPProviderEntity | None = None,
         authorization_code: str | None = None,
         forward_identity_active: bool = False,
+        *,
+        request_headers: Headers | None = None,
     ):
         """
         Initialize the MCP client with auth retry capability.
@@ -53,8 +56,10 @@ class MCPClientWithAuthRetry(MCPClient):
             authorization_code: Optional authorization code for initial auth
             forward_identity_active: If True, suppress the static-OAuth retry
                 on 401 — the forwarded identity must propagate as-is.
+            request_headers: Original caller headers, or None to use MCPClient's
+                current-request behavior.
         """
-        super().__init__(server_url, headers, timeout, sse_read_timeout)
+        super().__init__(server_url, headers, timeout, sse_read_timeout, request_headers=request_headers)
 
         self.provider_entity = provider_entity
         self.authorization_code = authorization_code

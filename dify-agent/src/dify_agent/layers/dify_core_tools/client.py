@@ -75,6 +75,7 @@ class _DifyCoreToolsRequestTool(BaseModel):
     credential_id: str | None = None
     tool_parameters: dict[str, JsonValue] = Field(default_factory=dict)
     runtime_parameters: dict[str, JsonValue] = Field(default_factory=dict)
+    mcp_request_headers_token: str | None = Field(default=None, repr=False, exclude_if=_is_none)
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
 
@@ -116,6 +117,7 @@ class DifyCoreToolsClient:
         tool_config: DifyCoreToolConfig,
         tool_parameters: dict[str, JsonValue],
     ) -> DifyCoreToolsInvokeResponse:
+        """Invoke the prepared tool, forwarding its opaque MCP token outside model arguments."""
         _validate_execution_context(execution_context)
         user_id = execution_context.user_id
         user_from = execution_context.user_from
@@ -147,6 +149,7 @@ class DifyCoreToolsClient:
                 credential_id=tool_config.credential_id,
                 tool_parameters=tool_parameters,
                 runtime_parameters=tool_config.runtime_parameters,
+                mcp_request_headers_token=tool_config.mcp_request_headers_token,
             ),
         )
 

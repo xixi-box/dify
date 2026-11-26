@@ -1,12 +1,13 @@
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack
 from types import TracebackType
 from typing import Any
 from urllib.parse import urlparse
 
 from flask import has_request_context, request
+from werkzeug.datastructures import Headers
 
 from core.mcp.client.sse_client import sse_client
 from core.mcp.client.streamable_client import streamablehttp_client
@@ -19,6 +20,18 @@ logger = logging.getLogger(__name__)
 _MAX_DISCOVERED_TOOLS = 10_000
 # Bound round trips independently of inventory size, including empty continuation pages.
 _MAX_TOOL_DISCOVERY_REQUESTS = 100
+_REQUEST_HEADER_PATTERN = re.compile(r"\{\{\s*request\.headers?\.(.+?)\s*\}\}", re.IGNORECASE)
+
+
+def referenced_request_headers(templates: Mapping[str, object], source: Headers) -> dict[str, str]:
+    """Copy only caller header values referenced by the configured MCP headers."""
+    names = {
+        match.group(1).lower()
+        for value in templates.values()
+        if isinstance(value, str)
+        for match in _REQUEST_HEADER_PATTERN.finditer(value)
+    }
+    return {name: source[name] for name in names if name in source}
 
 
 class MCPClient:
@@ -28,23 +41,29 @@ class MCPClient:
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
         sse_read_timeout: float | None = None,
+        *,
+        request_headers: Headers | None = None,
     ):
+        """Copy outbound headers and resolve templates against the original caller's headers.
+
+        An explicit source, including an empty one, takes precedence over Flask's
+        current request. With neither source available, keep the templates intact.
+        """
         self.server_url = server_url
         self.headers = headers.copy() if headers else {}
         self.timeout = timeout
         self.sse_read_timeout = sse_read_timeout
 
-        # Substitute placeholders with incoming request headers if in a request context
-        if has_request_context() and self.headers:
-            pattern = re.compile(r"\{\{\s*request\.headers?\.(.+?)\s*\}\}", re.IGNORECASE)
-            for key, value in list(self.headers.items()):
-                if isinstance(value, str):
-
-                    def replace_func(match):
-                        header_name = match.group(1)
-                        return request.headers.get(header_name, "")
-
-                    self.headers[key] = pattern.sub(replace_func, value)
+        if request_headers is None and has_request_context():
+            request_headers = request.headers
+        if request_headers is not None:
+            source = request_headers
+            self.headers = {
+                key: _REQUEST_HEADER_PATTERN.sub(lambda match: source.get(match.group(1), ""), value)
+                if isinstance(value, str)
+                else value
+                for key, value in self.headers.items()
+            }
 
         # Initialize session and client objects
         self._session: ClientSession | None = None
