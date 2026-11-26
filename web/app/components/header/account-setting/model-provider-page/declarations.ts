@@ -1,6 +1,7 @@
 import type {
   FormType as ContractFormType,
   GetWorkspacesCurrentDefaultModelResponse,
+  ParserCreateCredential,
   QuotaConfiguration,
 } from '@dify/contracts/api/console/workspaces/types.gen'
 import type { Field } from '@/app/components/workflow/nodes/llm/types'
@@ -324,11 +325,7 @@ export type ModelCredential = {
   current_credential_name?: string
 }
 
-export type ModelCredentialPayload = {
-  credentials: Record<string, unknown>
-  model: string
-  model_type: ModelTypeEnum
-  name?: string
+export type ModelCredentialPayload = ParserCreateCredential & {
   credential_id?: string
 }
 

@@ -5,7 +5,7 @@ from flask_restx import Resource
 from pydantic import BaseModel, Field, field_validator
 
 from controllers.common.fields import SimpleResultResponse, ValidationResultResponse
-from controllers.common.rbac import RBACCheck, Workspace
+from controllers.common.rbac import RBACCheck, Workspace, enforce_rbac_checks
 from controllers.common.schema import (
     query_params_from_model,
     register_enum_models,
@@ -22,6 +22,7 @@ from controllers.console.wraps import (
     setup_required,
     with_current_tenant_id,
     with_current_user,
+    with_current_user_id,
 )
 from core.entities.model_entities import DefaultModelSetting
 from core.entities.provider_entities import CredentialConfiguration
@@ -105,6 +106,12 @@ class ParserCredentialBase(BaseModel):
 class ParserCreateCredential(ParserCredentialBase):
     name: str | None = Field(default=None, max_length=30)
     credentials: dict[str, Any]
+    source_credential_id: str | None = None
+
+    @field_validator("source_credential_id")
+    @classmethod
+    def validate_source_credential_id(cls, value: str | None) -> str | None:
+        return uuid_value(value) if value is not None else None
 
 
 class ParserUpdateCredential(ParserCredentialBase):
@@ -406,9 +413,17 @@ class ModelProviderModelCredentialApi(Resource):
     @is_admin_or_owner_required
     @rbac_permission_required(RBACCheck(RBACPermission.CREDENTIAL_CREATE, Workspace()))
     @account_initialization_required
+    @with_current_user_id
     @with_current_tenant_id
     @model_validate(ParserCreateCredential)
-    def post(self, req_data: ParserCreateCredential, tenant_id: str, provider: str):
+    def post(self, req_data: ParserCreateCredential, tenant_id: str, user_id: str, provider: str):
+        """Create a model credential, with additional authorization to duplicate a saved connection."""
+        if req_data.source_credential_id is not None:
+            # Reuse creates a new, independently managed credential. Check both permissions.
+            for permission in (RBACPermission.CREDENTIAL_MANAGE, RBACPermission.CREDENTIAL_USE):
+                enforce_rbac_checks(
+                    tenant_id=tenant_id, account_id=user_id, checks=(RBACCheck(permission, Workspace()),)
+                )
         model_provider_service = ModelProviderService()
 
         try:
@@ -419,6 +434,7 @@ class ModelProviderModelCredentialApi(Resource):
                 model_type=req_data.model_type,
                 credentials=req_data.credentials,
                 credential_name=req_data.name,
+                source_credential_id=req_data.source_credential_id,
             )
         except CredentialsValidateFailedError as ex:
             logger.exception(

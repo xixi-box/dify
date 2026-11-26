@@ -1217,6 +1217,64 @@ class TestEntitiesProviderConfigurationCases:
         assert caplog.messages.count("Failed to decrypt model credential secret variable openai_api_key") == 1
 
     @staticmethod
+    def test_reuses_saved_connection_for_exact_new_model_ids(sqlite_provider_session: Session) -> None:
+        provider_name = "langgenius/openai_api_compatible/openai_api_compatible"
+        configuration = _build_provider_configuration(provider_name=provider_name)
+        base_url = "https://example.test/compatible-mode/v1"
+        source_config = json.dumps(
+            {"api_key": "encrypted-source", "endpoint_url": base_url, "endpoint_model_name": "first-model"}
+        )
+        source = _model_credential(
+            sqlite_provider_session, provider_name=provider_name, name="Model Studio", encrypted_config=source_config
+        )
+        other_workspace = _model_credential(
+            sqlite_provider_session, provider_name=provider_name, tenant_id="tenant-2", encrypted_config=source_config
+        )
+        submitted = {
+            "endpoint_url": "https://other.test",
+            "rerank_endpoint_url": "https://other.test/rerank",
+            "endpoint_model_name": "other-model",
+            "api_key": "override",
+            "context_size": "8192",
+        }
+        with (
+            patch("core.entities.provider_configuration.encrypter.decrypt_token", return_value="source-key") as decrypt,
+            patch.object(
+                ProviderConfiguration, "validate_custom_model_credentials", return_value={"api_key": "encrypted-new"}
+            ) as validate,
+            _mock_cache_boundaries(),
+        ):
+            for model_name in ("Vendor/Model-2026.02", "Vendor/Model-2026.03"):
+                new_id = configuration.create_custom_model_credential_from_connection(
+                    ModelType.LLM, model_name, submitted, source.id
+                )
+                validate.assert_called_with(
+                    model_type=ModelType.LLM,
+                    model=model_name,
+                    credentials={"api_key": "source-key", "endpoint_url": base_url, "context_size": "8192"},
+                )
+                model = sqlite_provider_session.scalar(
+                    select(ProviderModel).where(ProviderModel.model_name == model_name)
+                )
+                new_credential = sqlite_provider_session.get(ProviderModelCredential, new_id)
+                assert model is not None
+                assert model.credential_id == new_id
+                assert new_credential is not None
+                assert new_credential.credential_name == "Model Studio"
+                assert json.loads(new_credential.encrypted_config) == {"api_key": "encrypted-new"}
+            with pytest.raises(ValueError, match="Saved connection not found"):
+                configuration.create_custom_model_credential_from_connection(
+                    ModelType.LLM, "blocked-model", submitted, other_workspace.id
+                )
+            assert validate.call_count == 2
+            assert decrypt.call_count == 2
+            decrypt.assert_called_with(tenant_id="tenant-1", token="encrypted-source")
+
+        sqlite_provider_session.refresh(source)
+        assert source.encrypted_config == source_config
+        assert submitted["api_key"] == "override"
+
+    @staticmethod
     def test_create_update_and_delete_custom_model_credential(sqlite_provider_session: Session) -> None:
         configuration = _build_provider_configuration()
         with (

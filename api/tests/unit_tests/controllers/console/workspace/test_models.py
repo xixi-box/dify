@@ -329,9 +329,53 @@ class TestModelProviderModelCredentialApi:
             app.test_request_context("/", json=payload),
             patch("controllers.console.workspace.models.ModelProviderService"),
         ):
-            result, status = method(api, ParserCreateCredential.model_validate(payload), "tenant1", "openai")
+            result, status = method(api, ParserCreateCredential.model_validate(payload), "tenant1", "u1", "openai")
 
         assert status == 201
+
+    def test_create_credential_with_connection_requires_permission_to_copy_and_use_it(self, app: Flask) -> None:
+        api = ModelProviderModelCredentialApi()
+        account = make_account(role=TenantAccountRole.OWNER)
+        identity = AccountWithTenant(account, "tenant1")
+        payload = {
+            "model": "qwen/Model-2026.02",
+            "model_type": ModelType.LLM,
+            "credentials": {},
+            "source_credential_id": "89ebfb35-f67e-4fcb-913c-405d10ebd5da",
+        }
+        provider = "langgenius/openai_api_compatible/openai_api_compatible"
+        with (
+            app.test_request_context("/", method="POST", json=payload),
+            config_overrides_context(LOGIN_DISABLED=True, RBAC_ENABLED=True),
+            patch("controllers.console.wraps._is_setup_completed", return_value=True),
+            patch("controllers.console.wraps.current_account_with_tenant", return_value=identity),
+            patch("controllers.common.wraps.current_account_with_tenant", return_value=identity),
+            patch("controllers.console.workspace.models.ModelProviderService") as service,
+            patch("controllers.common.rbac.checks.RBACService.CheckAccess.check") as check,
+        ):
+            g._login_user = account
+            check.side_effect = [True, True, False]
+            with pytest.raises(Forbidden):
+                api.post(provider=provider)
+            service.return_value.create_model_credential.assert_not_called()
+            assert [call.kwargs["scene"] for call in check.call_args_list] == [
+                RBACPermission.CREDENTIAL_CREATE,
+                RBACPermission.CREDENTIAL_MANAGE,
+                RBACPermission.CREDENTIAL_USE,
+            ]
+
+            check.side_effect = [True, True, True]
+            _, status = api.post(provider=provider)
+            assert status == 201
+            service.return_value.create_model_credential.assert_called_once_with(
+                tenant_id="tenant1",
+                provider=provider,
+                model="qwen/Model-2026.02",
+                model_type=ModelType.LLM,
+                credentials={},
+                credential_name=None,
+                source_credential_id=payload["source_credential_id"],
+            )
 
     def test_get_empty_credentials(self, app: Flask) -> None:
         api = ModelProviderModelCredentialApi()

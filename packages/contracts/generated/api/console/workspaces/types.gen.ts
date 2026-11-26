@@ -644,6 +644,7 @@ export type ParserCreateCredential = {
   model: string
   model_type: ModelType
   name?: string | null
+  source_credential_id?: string | null
 }
 
 export type ParserUpdateCredential = {

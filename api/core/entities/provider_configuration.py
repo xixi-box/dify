@@ -1060,6 +1060,44 @@ class ProviderConfiguration(BaseModel):
 
         return validated_credentials
 
+    def create_custom_model_credential_from_connection(
+        self, model_type: ModelType, model: str, credentials: dict[str, Any], source_credential_id: str
+    ) -> str:
+        """Reuse an authorized OpenAI-compatible connection in a new model credential.
+
+        The source must belong to this workspace and provider. The API key stays
+        paired with its saved URL, and validation is for the exact destination model.
+        The normal creation path persists the new credential only after validation.
+        """
+        if str(ModelProviderID(self.provider.provider)) != "langgenius/openai_api_compatible/openai_api_compatible":
+            raise ValueError("This provider does not support connection reuse.")
+
+        with Session(db.engine) as session:
+            stmt = select(ProviderModelCredential.encrypted_config, ProviderModelCredential.credential_name).where(
+                ProviderModelCredential.id == source_credential_id,
+                ProviderModelCredential.tenant_id == self.tenant_id,
+                ProviderModelCredential.provider_name.in_(self._get_provider_names()),
+            )
+            source = session.execute(stmt).one_or_none()
+        if source is None:
+            raise ValueError("Saved connection not found.")
+
+        self._check_credential_policy_once(source_credential_id)
+        encrypted_config, name = source
+        connection = json.loads(encrypted_config)
+        endpoint = connection.get("endpoint_url")
+        if not isinstance(endpoint, str) or not endpoint:
+            raise ValueError("Saved connection has no API base URL.")
+        model_credentials = {
+            key: value
+            for key, value in credentials.items()
+            if key not in {"api_key", "endpoint_url", "endpoint_model_name", "rerank_endpoint_url"}
+        }
+        model_credentials["endpoint_url"] = endpoint
+        if encrypted_key := connection.get("api_key"):
+            model_credentials["api_key"] = encrypter.decrypt_token(tenant_id=self.tenant_id, token=encrypted_key)
+        return self.create_custom_model_credential(model_type, model, model_credentials, name)
+
     def create_custom_model_credential(
         self, model_type: ModelType, model: str, credentials: dict[str, Any], credential_name: str | None
     ) -> str:

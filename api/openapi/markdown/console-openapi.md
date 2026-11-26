@@ -16449,6 +16449,8 @@ performs no writes or provider I/O. Storage failures propagate normally.
 | default | Error | **application/json**: [ErrorResponse](#errorresponse)<br> |
 
 ### [POST] /workspaces/current/model-providers/{provider}/models/credentials
+**Create a model credential, with additional authorization to duplicate a saved connection**
+
 #### Parameters
 
 | Name | Located in | Description | Required | Schema |
@@ -33769,6 +33771,7 @@ Enum class for parameter type.
 | model | string |  | Yes |
 | model_type | [ModelType](#modeltype) |  | Yes |
 | name | string |  | No |
+| source_credential_id | string |  | No |
 
 #### ParserCredentialCreate
 

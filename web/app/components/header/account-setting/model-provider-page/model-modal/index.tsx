@@ -46,6 +46,15 @@ import { ConfigurationMethodEnum, FormTypeEnum, ModelModalModeEnum } from '../de
 import { useLanguage } from '../hooks'
 import { CredentialSelector } from '../model-auth'
 import { useModelFormSchemas } from '../model-auth/hooks'
+import { OPENAI_COMPATIBLE_PROVIDER } from '../openai-compatible'
+
+const connectionFields = new Set([
+  '__authorization_name__',
+  'api_key',
+  'endpoint_url',
+  'endpoint_model_name',
+  'rerank_endpoint_url',
+])
 
 type ModelModalProps = {
   provider: ModelProvider
@@ -107,6 +116,27 @@ const ModelModal: FC<ModelModalProps> = ({
   const [selectedCredential, setSelectedCredential] = useState<
     (Credential & { addNewCredential?: boolean }) | undefined
   >()
+  const savedConnections = useMemo(
+    () =>
+      mode === ModelModalModeEnum.configCustomModel &&
+      provider.provider === OPENAI_COMPATIBLE_PROVIDER &&
+      canCreateCredential &&
+      canManageCredential &&
+      canUseCredential
+        ? (provider.custom_configuration.custom_models ?? []).flatMap((model) =>
+            (model.available_model_credentials ?? [])
+              .filter((connection) => !connection.not_allowed_to_use)
+              .map((connection) => ({
+                ...connection,
+                credential_name: `${connection.credential_name ?? ''} (${model.model})`,
+              })),
+          )
+        : [],
+    [canCreateCredential, canManageCredential, canUseCredential, mode, provider],
+  )
+  const sourceCredentialId = savedConnections.find(
+    (connection) => connection.credential_id === selectedCredential?.credential_id,
+  )?.credential_id
   const credentialFormRef = useRef<FormRefObject>(null)
   const isEditMode =
     !!credential &&
@@ -191,6 +221,7 @@ const ModelModal: FC<ModelModalProps> = ({
         credential_id: credential?.credential_id,
         credentials: rest,
         name: __authorization_name__,
+        ...(sourceCredentialId ? { source_credential_id: sourceCredentialId } : {}),
         ...(shouldSaveModelCredential ? { model: __model_name, model_type: __model_type } : {}),
       }),
       values,
@@ -198,6 +229,7 @@ const ModelModal: FC<ModelModalProps> = ({
   }, [
     mode,
     selectedCredential,
+    sourceCredentialId,
     model,
     currentCustomConfigurationModelFixedFields,
     canUseCredential,
@@ -290,7 +322,12 @@ const ModelModal: FC<ModelModalProps> = ({
 
   const fields =
     mode === ModelModalModeEnum.configCustomModel
-      ? [...modelNameAndTypeFormSchemas, ...formSchemas]
+      ? [
+          ...modelNameAndTypeFormSchemas,
+          ...formSchemas.filter(
+            (schema) => !sourceCredentialId || !connectionFields.has(schema.variable),
+          ),
+        ]
       : formSchemas
   const notAllowCustomCredential = provider.allow_custom_token === false
   const isOfficialOpenAIProvider =
@@ -308,6 +345,14 @@ const ModelModal: FC<ModelModalProps> = ({
         />
       </DialogHeader>
       <DialogBody>
+        {savedConnections.length > 0 && (
+          <CredentialSelector
+            credentials={savedConnections}
+            onSelect={setSelectedCredential}
+            selectedCredential={selectedCredential}
+            disabled={doingAction}
+          />
+        )}
         {mode === ModelModalModeEnum.addCustomModelToModelList && (
           <CredentialSelector
             credentials={available_credentials || []}

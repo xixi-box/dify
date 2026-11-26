@@ -7,6 +7,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { LoadingPlaceholder } from '@/app/components/base/loading-placeholder'
 import List from '@/app/components/plugins/marketplace/list'
+import {
+  MARKETPLACE_PANEL_CACHE_OPTIONS,
+  useMarketplacePlugins,
+} from '@/app/components/plugins/marketplace/query'
 import { usePluginSettingsAccess } from '@/app/components/plugins/plugin-page/use-reference-setting'
 import ProviderCard from '@/app/components/plugins/provider-card'
 import { PluginCategoryEnum } from '@/app/components/plugins/types'
@@ -14,6 +18,7 @@ import { useResolvedTheme } from '@/features/theme/hooks'
 import Link from '@/next/link'
 import { consoleQuery } from '@/service/console'
 import { useMarketplaceAllPlugins } from './hooks'
+import { OPENAI_COMPATIBLE_PLUGIN } from './openai-compatible'
 
 type InstallFromMarketplaceProps = {
   marketplace: MarketplaceLinks
@@ -49,6 +54,29 @@ const InstallFromMarketplace = ({
     installedPluginIds ?? [],
     shouldLoadMarketplace && hasLoadedInstalledPluginIds,
   )
+  const compatibleProvider = !searchText
+    ? allPlugins?.find((plugin) => plugin.plugin_id === OPENAI_COMPATIBLE_PLUGIN)
+    : undefined
+  const shouldFindCompatibleProvider =
+    shouldLoadMarketplace &&
+    hasLoadedInstalledPluginIds &&
+    !searchText &&
+    !isAllPluginsLoading &&
+    !installedPluginIds?.includes(OPENAI_COMPATIBLE_PLUGIN) &&
+    !compatibleProvider
+  const { data: compatibleResults } = useMarketplacePlugins(
+    shouldFindCompatibleProvider
+      ? { query: 'openai_api_compatible', category: PluginCategoryEnum.model, type: 'plugin' }
+      : undefined,
+    MARKETPLACE_PANEL_CACHE_OPTIONS,
+  )
+  const featuredProvider =
+    compatibleProvider ??
+    (shouldFindCompatibleProvider
+      ? compatibleResults?.pages[0]?.plugins.find(
+          (plugin) => plugin.plugin_id === OPENAI_COMPATIBLE_PLUGIN,
+        )
+      : undefined)
 
   useEffect(() => {
     const section = sectionRef.current
@@ -154,7 +182,16 @@ const InstallFromMarketplace = ({
           <List
             marketplaceCollections={[]}
             marketplaceCollectionPluginsMap={{}}
-            plugins={allPlugins}
+            plugins={
+              featuredProvider
+                ? [
+                    featuredProvider,
+                    ...(allPlugins ?? []).filter(
+                      (plugin) => plugin.plugin_id !== featuredProvider.plugin_id,
+                    ),
+                  ]
+                : allPlugins
+            }
             showInstallButton={canInstallPlugin}
             cardContainerClassName="grid grid-cols-3 gap-2"
             cardRender={cardRender}

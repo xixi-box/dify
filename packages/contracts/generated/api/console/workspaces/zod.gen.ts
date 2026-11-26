@@ -2017,6 +2017,7 @@ export const zParserCreateCredential = z.object({
   model: z.string(),
   model_type: zModelType,
   name: z.string().max(30).nullish(),
+  source_credential_id: z.string().nullish(),
 })
 
 /**

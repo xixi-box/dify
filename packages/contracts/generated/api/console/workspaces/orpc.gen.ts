@@ -2375,6 +2375,9 @@ export const get33 = oc
   )
   .output(zGetWorkspacesCurrentModelProvidersByProviderModelsCredentialsResponse)
 
+/**
+ * Create a model credential, with additional authorization to duplicate a saved connection
+ */
 export const post33 = oc
   .route({
     inputStructure: 'detailed',
@@ -2382,6 +2385,8 @@ export const post33 = oc
     operationId: 'postWorkspacesCurrentModelProvidersByProviderModelsCredentials',
     path: '/workspaces/current/model-providers/{provider}/models/credentials',
     successStatus: 201,
+    summary:
+      'Create a model credential, with additional authorization to duplicate a saved connection',
     tags: ['console'],
   })
   .input(

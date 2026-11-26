@@ -656,6 +656,8 @@ class ModelProviderService:
         model: str,
         credentials: dict[str, Any],
         credential_name: str | None,
+        *,
+        source_credential_id: str | None = None,
     ) -> str:
         """
         create and save model credentials.
@@ -666,9 +668,17 @@ class ModelProviderService:
         :param model: model name
         :param credentials: model credentials dict
         :param credential_name: credential name
+        :param source_credential_id: existing connection to reuse, if authorized by the caller
         :return:
         """
         provider_configuration = self._get_provider_configuration(tenant_id, provider)
+        if source_credential_id is not None:
+            return provider_configuration.create_custom_model_credential_from_connection(
+                model_type=ModelType(model_type),
+                model=model,
+                credentials=credentials,
+                source_credential_id=source_credential_id,
+            )
         return provider_configuration.create_custom_model_credential(
             model_type=ModelType(model_type),
             model=model,
