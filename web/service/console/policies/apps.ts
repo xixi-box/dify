@@ -599,6 +599,9 @@ export function appPolicies(consoleQuery: ConsoleQuery): ConsolePolicies['apps']
                 ])
                 return invalidateQueryKeys(client, [
                   consoleQuery.apps.byAppId.workflows.publish.get.key({ input: { params } }),
+                  consoleQuery.workspaces.current.toolProvider.workflow.get.get.key({
+                    input: { query: { workflow_app_id: params.app_id } },
+                  }),
                 ])
               },
             },

@@ -5140,15 +5140,20 @@ export const get81 = oc
   .errors({ app_not_found: { status: 404, data: zAppNotFoundError } })
 
 /**
- * Publish workflow
+ * Publish the admitted app's draft and optionally advance its compatible tool
+ *
+ * The tool update requires workspace tool-management access. The workflow,
+ * App pointer, and any tool version change commit or roll back together.
  */
 export const post68 = oc
   .route({
+    description:
+      'The tool update requires workspace tool-management access. The workflow,\nApp pointer, and any tool version change commit or roll back together.',
     inputStructure: 'detailed',
     method: 'POST',
     operationId: 'postAppsByAppIdWorkflowsPublish',
     path: '/apps/{app_id}/workflows/publish',
-    summary: 'Publish workflow',
+    summary: "Publish the admitted app's draft and optionally advance its compatible tool",
     tags: ['console'],
   })
   .input(

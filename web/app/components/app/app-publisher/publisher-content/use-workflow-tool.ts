@@ -68,7 +68,7 @@ export function useWorkflowTool({
   }
 
   const configuration = useConfigureButton({
-    enabled: visible && canManageTools,
+    enabled: visible,
     published,
     detailNeedUpdate: published && appPublished,
     workflowAppId: appId ?? '',

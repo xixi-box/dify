@@ -14,6 +14,7 @@ type WorkflowToolActionProps = {
   isLoading: boolean
   message?: string
   outdated: boolean
+  updatePending: boolean
   published: boolean
   onConfigure: () => void
 }
@@ -23,6 +24,7 @@ const WorkflowToolAction = ({
   isLoading,
   message,
   outdated,
+  updatePending,
   published,
   onConfigure,
 }: WorkflowToolActionProps) => {
@@ -59,9 +61,11 @@ const WorkflowToolAction = ({
     ? t(($) => $['common.workflowAsToolReconfigure'], { ns: 'workflow' })
     : t(($) => $['common.configure'], { ns: 'workflow' })
   const manageInToolsLabel = t(($) => $['common.manageInTools'], { ns: 'workflow' })
-  const stateLabel = outdated
-    ? t(($) => $['common.workflowAsToolUpdateNeeded'], { ns: 'workflow' })
-    : t(($) => $['common.workflowAsToolReady'], { ns: 'workflow' })
+  const stateLabel = updatePending
+    ? t(($) => $['common.workflowToolUpdatePending'], { ns: 'workflow' })
+    : outdated
+      ? t(($) => $['common.workflowAsToolUpdateNeeded'], { ns: 'workflow' })
+      : t(($) => $['common.workflowAsToolReady'], { ns: 'workflow' })
 
   return (
     <div className={cn('flex w-full flex-col rounded-lg', disabled && 'opacity-30')}>
@@ -80,7 +84,7 @@ const WorkflowToolAction = ({
             >
               {workflowToolLabel}
             </span>
-            <WorkflowToolStateLabel label={stateLabel} outdated={outdated} />
+            <WorkflowToolStateLabel label={stateLabel} outdated={outdated || updatePending} />
           </div>
           {outdated && (
             <p className="pe-4 pb-1 system-xs-regular text-text-warning">

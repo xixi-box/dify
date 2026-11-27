@@ -1562,11 +1562,12 @@ export const zWorkflowDraftVariableUpdatePayload = z.object({
 })
 
 /**
- * PublishWorkflowPayload
+ * PublishAppWorkflowPayload
  */
-export const zPublishWorkflowPayload = z.object({
+export const zPublishAppWorkflowPayload = z.object({
   marked_comment: z.string().max(100).nullish(),
   marked_name: z.string().max(20).nullish(),
+  sync_workflow_tool: z.boolean().optional().default(false),
 })
 
 /**
@@ -1576,6 +1577,14 @@ export const zWorkflowPublishResponse = z.object({
   created_at: z.int(),
   result: z.string(),
   warning: z.string().nullish(),
+})
+
+/**
+ * PublishWorkflowPayload
+ */
+export const zPublishWorkflowPayload = z.object({
+  marked_comment: z.string().max(100).nullish(),
+  marked_name: z.string().max(20).nullish(),
 })
 
 /**
@@ -8985,7 +8994,7 @@ export const zGetAppsByAppIdWorkflowsPublishPath = z.object({
  */
 export const zGetAppsByAppIdWorkflowsPublishResponse = zWorkflowResponse
 
-export const zPostAppsByAppIdWorkflowsPublishBody = zPublishWorkflowPayload
+export const zPostAppsByAppIdWorkflowsPublishBody = zPublishAppWorkflowPayload
 
 export const zPostAppsByAppIdWorkflowsPublishPath = z.object({
   app_id: z.uuid(),

@@ -228,6 +228,7 @@ export function useConfigureButton(options: UseConfigureButtonOptions) {
   return {
     isLoading,
     outdated,
+    updatePending: detail?.synced === false,
     payload,
     handleCreate,
     handleUpdate,

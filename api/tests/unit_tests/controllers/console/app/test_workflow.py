@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from inspect import unwrap
 from types import SimpleNamespace
-from typing import NoReturn
+from typing import NoReturn, cast
 from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
@@ -16,7 +17,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
-from werkzeug.exceptions import HTTPException, NotFound, ServiceUnavailable, UnprocessableEntity
+from werkzeug.exceptions import Forbidden, HTTPException, NotFound, ServiceUnavailable, UnprocessableEntity
 
 from controllers.common.errors import InvalidArgumentError
 from controllers.console import wraps as console_wraps
@@ -44,10 +45,14 @@ from models.account import Account as _workflow_human_input_debug_api_Account
 from models.account import AccountStatus, TenantAccountRole
 from models.model import App as _workflow_App
 from models.model import AppMode, IconType
+from models.tools import WorkflowToolProvider
 from models.workflow import Workflow, WorkflowType
+from repositories.workflow_tool_source_repository import SQLAlchemyWorkflowToolSourceRepository
 from services import workflow_variable_reference_validator as variable_reference_validator
 from services.app.access import AppAccessFilter
 from services.errors.app import TriggerNodeLimitExceededError as TriggerNodeLimitExceededServiceError
+from services.tools.workflow_tools_manage_service import WorkflowToolManageService
+from services.workflow_tool_source_service import WorkflowToolSnapshot, WorkflowToolSourceService
 from tests.helpers.unit.config_override import apply_config_overrides
 from tests.helpers.unit.controllers.error_body import raised_error
 from tests.helpers.unit.model_factories import make_app
@@ -153,6 +158,166 @@ def _make_workflow(**overrides) -> Workflow:
     return workflow
 
 
+@pytest.mark.parametrize(
+    ("sync_requested", "contract_change", "expected_to_sync"),
+    [
+        pytest.param(True, None, True, id="internal-edit"),
+        pytest.param(False, None, False, id="manual-publish"),
+        pytest.param(True, "requiredness", False, id="changed-requiredness"),
+        pytest.param(True, "output", False, id="changed-output"),
+        pytest.param(True, "files", False, id="changed-file-policy"),
+    ],
+)
+def test_publish_workflow_tool_snapshot(
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    sqlite_engine: Engine,
+    config_overrides: Callable[..., None],
+    sync_requested: bool,
+    contract_change: str | None,
+    expected_to_sync: bool,
+) -> None:
+    config_overrides(DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY, RBAC_ENABLED=False)
+    app = Flask(__name__)
+    app.config["SQLALCHEMY_DATABASE_URI"] = str(sqlite_engine.url)
+    workflow_module.db.init_app(app)
+    account = _account()
+    account.role = TenantAccountRole.OWNER
+    app_model = _workflow_app()
+    original_graph: dict[str, object] = {
+        "nodes": [
+            {
+                "id": "start",
+                "data": {
+                    "type": "start",
+                    "variables": [
+                        {"variable": "query", "label": "Query", "type": "text-input", "required": False},
+                    ],
+                },
+            },
+            {
+                "id": "code",
+                "data": {
+                    "type": "code",
+                    "code_language": "python3",
+                    "code": 'def main():\n    return {"result": "Original answer"}',
+                    "variables": [],
+                    "outputs": {"result": {"type": "string", "children": None}},
+                },
+            },
+            {
+                "id": "end",
+                "data": {
+                    "type": "end",
+                    "outputs": [{"variable": "answer", "value_selector": ["code", "result"], "value_type": "string"}],
+                },
+            },
+        ],
+        "edges": [{"source": "start", "target": "code"}, {"source": "code", "target": "end"}],
+    }
+    published = _make_workflow(graph_dict=original_graph, environment_variables=[], conversation_variables=[])
+    draft_graph = json.loads(published.graph)
+    draft_graph["nodes"][1]["data"]["code"] = 'def main():\n    return {"result": "Updated answer"}'
+    draft_features = published.features_dict
+    if contract_change == "requiredness":
+        draft_graph["nodes"][0]["data"]["variables"][0]["required"] = True
+    elif contract_change == "output":
+        draft_graph["nodes"][2]["data"]["outputs"][0]["value_type"] = "number"
+    elif contract_change == "files":
+        draft_features["file_upload"] = {"enabled": True, "allowed_file_upload_methods": ["local_file"]}
+
+    draft = _make_workflow(
+        id="draft",
+        version=Workflow.VERSION_DRAFT,
+        graph_dict=draft_graph,
+        features_dict=draft_features,
+        environment_variables=[],
+        conversation_variables=[],
+    )
+    app_model.workflow_id = published.id
+    provider = WorkflowToolProvider(
+        app_id=app_model.id,
+        tenant_id=app_model.tenant_id,
+        user_id=account.id,
+        version=published.version,
+        name="child_workflow",
+        label="Child workflow",
+        icon=json.dumps({"content": "🛠", "background": "#fff"}),
+        description="Tool description",
+        parameter_configuration=json.dumps([{"name": "query", "description": "Search query", "form": "llm"}]),
+    )
+    sqlite_session.add_all([app_model, published, draft, provider])
+    sqlite_session.commit()
+
+    source_service = WorkflowToolSourceService(SQLAlchemyWorkflowToolSourceRepository(sqlite_session_factory))
+    parent_graph = {
+        "nodes": [{"data": {"type": "tool", "provider_type": "workflow", "provider_id": provider.id}}],
+    }
+    previous_run = source_service.load(tenant_id=app_model.tenant_id, graph_config=parent_graph)
+    snapshot = WorkflowToolSnapshot.model_validate_json(previous_run.snapshot().model_dump_json())
+
+    with app.test_request_context(
+        "/apps/app/workflows/publish", method="POST", json={"sync_workflow_tool": True} if sync_requested else {}
+    ):
+        # Exercise the same request parser as the Console route, bypassing authentication setup.
+        publish = workflow_module.PublishedWorkflowApi.post
+        handler = inspect.unwrap(publish)
+        while (wrapped := getattr(publish, "__wrapped__", None)) is not handler:
+            assert wrapped is not None
+            publish = wrapped
+        parse_and_publish = cast(Callable[..., dict[str, object]], publish)
+        response = parse_and_publish(workflow_module.PublishedWorkflowApi(), current_user=account, app_model=app_model)
+
+    assert response["result"] == "success"
+    sqlite_session.refresh(app_model)
+    latest_workflow_id = app_model.workflow_id
+    assert latest_workflow_id is not None
+    assert latest_workflow_id != published.id
+    latest = source_service.load(tenant_id=app_model.tenant_id, graph_config=parent_graph)
+    expected_workflow_id = latest_workflow_id if expected_to_sync else published.id
+    assert latest.tools[provider.id].workflow_id == expected_workflow_id
+    expected_graph = draft_graph if expected_to_sync else original_graph
+    assert latest.sources[expected_workflow_id].graph_config == expected_graph
+    assert latest.tools[provider.id].entity == previous_run.tools[provider.id].entity
+
+    resumed = source_service.load(tenant_id=app_model.tenant_id, graph_config=parent_graph, snapshot=snapshot)
+    assert resumed.tools[provider.id].workflow_id == published.id
+    assert resumed.sources[published.id].graph_config == original_graph
+
+    with app.app_context():
+        details = WorkflowToolManageService.get_workflow_tool_by_app_id(account.id, app_model.tenant_id, app_model.id)
+        assert details["synced"] is expected_to_sync
+
+        if not sync_requested:
+            WorkflowToolManageService.update_workflow_tool(
+                user_id=account.id,
+                tenant_id=app_model.tenant_id,
+                workflow_tool_id=provider.id,
+                name=provider.name,
+                label=provider.label,
+                icon=json.loads(provider.icon),
+                description=provider.description,
+                parameters=provider.parameter_configurations,
+            )
+            details = WorkflowToolManageService.get_workflow_tool_by_app_id(
+                account.id, app_model.tenant_id, app_model.id
+            )
+            assert details["synced"] is True
+
+
+def test_publish_with_tool_sync_requires_workspace_tool_management(config_overrides: Callable[..., None]) -> None:
+    config_overrides(RBAC_ENABLED=False)
+    account = _account()
+    account.role = TenantAccountRole.EDITOR
+    with pytest.raises(Forbidden):
+        inspect.unwrap(workflow_module.PublishedWorkflowApi.post)(
+            workflow_module.PublishedWorkflowApi(),
+            workflow_module.PublishAppWorkflowPayload(sync_workflow_tool=True),
+            account,
+            _workflow_app(),
+        )
+
+
 class TestWorkflowCases:
     @staticmethod
     @pytest.fixture(autouse=True)
@@ -217,7 +382,7 @@ class TestWorkflowCases:
         with app.test_request_context("/apps/app-1/workflows/publish", method="POST", json={}):
             response = inspect.unwrap(workflow_module.PublishedWorkflowApi.post)(
                 workflow_module.PublishedWorkflowApi(),
-                workflow_module.PublishWorkflowPayload.model_validate({}),
+                workflow_module.PublishAppWorkflowPayload.model_validate({}),
                 current_user,
                 app_model,
             )
@@ -260,7 +425,7 @@ class TestWorkflowCases:
             with pytest.raises(RuntimeError, match="publish failed"):
                 inspect.unwrap(workflow_module.PublishedWorkflowApi.post)(
                     workflow_module.PublishedWorkflowApi(),
-                    workflow_module.PublishWorkflowPayload.model_validate({}),
+                    workflow_module.PublishAppWorkflowPayload.model_validate({}),
                     current_user,
                     app_model,
                 )
@@ -290,7 +455,7 @@ class TestWorkflowCases:
             with pytest.raises(TriggerNodeLimitExceededError) as exc_info:
                 inspect.unwrap(workflow_module.PublishedWorkflowApi.post)(
                     workflow_module.PublishedWorkflowApi(),
-                    workflow_module.PublishWorkflowPayload.model_validate({}),
+                    workflow_module.PublishAppWorkflowPayload.model_validate({}),
                     current_user,
                     app_model,
                 )

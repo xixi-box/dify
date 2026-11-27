@@ -1,11 +1,14 @@
 import type { WorkflowResponse } from '@dify/contracts/api/console/apps/types.gen'
 import type { CSSProperties, ReactNode, RefObject } from 'react'
 import type { ModelAndParameter } from '../../configuration/debug/types'
-import type { AppPublisherProps } from '../types'
+import type { AppPublisherProps, AppPublisherPublishOptions } from '../types'
 import type { PublishWorkflowParams } from '@/types/workflow'
 import { Button } from '@langgenius/dify-ui/button'
+import { Checkbox } from '@langgenius/dify-ui/checkbox'
+import { Field, FieldLabel } from '@langgenius/dify-ui/field'
 import { Kbd, KbdGroup } from '@langgenius/dify-ui/kbd'
 import { formatForDisplay, useHotkey } from '@tanstack/react-hotkeys'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import UpgradeBtn from '@/app/components/billing/upgrade-btn'
 import { getWorkflowVersionName } from '@/app/components/workflow/utils/version'
@@ -30,7 +33,10 @@ type PublisherSummarySectionProps = Pick<
   | 'startNodeLimitExceeded'
 > & {
   formatTimeFromNow: (value: number) => string
-  handlePublish: (params?: ModelAndParameter | PublishWorkflowParams) => Promise<void>
+  handlePublish: (
+    params?: ModelAndParameter | PublishWorkflowParams,
+    options?: AppPublisherPublishOptions,
+  ) => Promise<void>
   handleRestore: () => Promise<void>
   environmentTabs?: ReactNode
   isChatApp: boolean
@@ -39,6 +45,7 @@ type PublisherSummarySectionProps = Pick<
   isWorkflowApp?: boolean
   onEditVersion?: () => void
   published: boolean
+  showSyncWorkflowTool?: boolean
   upgradeHighlightStyle: CSSProperties
   versionInfo?: PublisherVersionInfo | null
 }
@@ -60,10 +67,12 @@ export function PublisherSummarySection({
   published,
   publishedAt,
   startNodeLimitExceeded = false,
+  showSyncWorkflowTool = false,
   upgradeHighlightStyle,
   versionInfo,
 }: PublisherSummarySectionProps) {
   const { t } = useTranslation(['workflow', 'workflowHistory'])
+  const [syncWorkflowTool, setSyncWorkflowTool] = useState(false)
   const hasPublishedVersion = Boolean(publishedAt)
   const publishedTimestamp =
     publishedAt || (versionInfo?.created_at ? versionInfo.created_at * 1000 : undefined)
@@ -79,6 +88,8 @@ export function PublisherSummarySection({
 
   function requestPublish(params?: ModelAndParameter | PublishWorkflowParams) {
     if (publishButtonDisabled || isPublishing) return
+    if (showSyncWorkflowTool && syncWorkflowTool)
+      return handlePublish(params, { syncWorkflowTool: true })
     return handlePublish(params)
   }
 
@@ -198,28 +209,44 @@ export function PublisherSummarySection({
           />
         ) : (
           <>
-            <Button
-              variant="primary"
-              className="w-full"
-              onClick={() => void requestPublish()}
-              disabled={publishButtonDisabled}
-              loading={isPublishing}
+            <form
+              className="flex flex-col gap-2"
+              onSubmit={(event) => {
+                event.preventDefault()
+                void requestPublish()
+              }}
             >
-              {publishDisabled ? (
-                publishButtonLabel
-              ) : (
-                <span className="flex items-center gap-1">
-                  <span>{publishButtonLabel}</span>
-                  <KbdGroup aria-hidden>
-                    {formatForDisplay(APP_PUBLISH_HOTKEY, { parts: true }).map((key) => (
-                      <Kbd key={key} color="white" disabled={publishButtonDisabled}>
-                        {key}
-                      </Kbd>
-                    ))}
-                  </KbdGroup>
-                </span>
+              {showSyncWorkflowTool && !published && (
+                <Field disabled={publishButtonDisabled || isPublishing}>
+                  <FieldLabel className="flex items-start gap-2 system-xs-regular text-text-secondary">
+                    <Checkbox checked={syncWorkflowTool} onCheckedChange={setSyncWorkflowTool} />
+                    {t(($) => $['common.syncWorkflowToolOnPublish'], { ns: 'workflow' })}
+                  </FieldLabel>
+                </Field>
               )}
-            </Button>
+              <Button
+                variant="primary"
+                className="w-full"
+                type="submit"
+                disabled={publishButtonDisabled}
+                loading={isPublishing}
+              >
+                {publishDisabled ? (
+                  publishButtonLabel
+                ) : (
+                  <span className="flex items-center gap-1">
+                    <span>{publishButtonLabel}</span>
+                    <KbdGroup aria-hidden>
+                      {formatForDisplay(APP_PUBLISH_HOTKEY, { parts: true }).map((key) => (
+                        <Kbd key={key} color="white" disabled={publishButtonDisabled}>
+                          {key}
+                        </Kbd>
+                      ))}
+                    </KbdGroup>
+                  </span>
+                )}
+              </Button>
+            </form>
             {startNodeLimitExceeded && (
               <div className="mt-3 flex flex-col items-stretch">
                 <p

@@ -1619,9 +1619,10 @@ export type WorkflowDraftVariableUpdatePayload = {
   value?: unknown | null
 }
 
-export type PublishWorkflowPayload = {
+export type PublishAppWorkflowPayload = {
   marked_comment?: string | null
   marked_name?: string | null
+  sync_workflow_tool?: boolean
 }
 
 export type WorkflowPublishResponse = {
@@ -1634,6 +1635,11 @@ export type TriggerNodeLimitExceededError = ErrorResponse & {
   code: 'trigger_node_limit_exceeded'
   details?: TriggerNodeLimitDetails
   status: 403
+}
+
+export type PublishWorkflowPayload = {
+  marked_comment?: string | null
+  marked_name?: string | null
 }
 
 export type WebhookTriggerResponse = {
@@ -9661,7 +9667,7 @@ export type GetAppsByAppIdWorkflowsPublishResponse =
   GetAppsByAppIdWorkflowsPublishResponses[keyof GetAppsByAppIdWorkflowsPublishResponses]
 
 export type PostAppsByAppIdWorkflowsPublishData = {
-  body: PublishWorkflowPayload
+  body: PublishAppWorkflowPayload
   path: {
     app_id: string
   }

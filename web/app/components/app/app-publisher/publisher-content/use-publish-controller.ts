@@ -123,12 +123,15 @@ export function usePublishController({
     })
   }
 
-  async function handlePublish(params?: AppPublisherPublishParams) {
+  async function handlePublish(
+    params?: AppPublisherPublishParams,
+    options?: AppPublisherPublishOptions,
+  ) {
     if (publishingRef.current) return
     publishingRef.current = true
     setIsPublishing(true)
     try {
-      await publishApp(onPublish, params)
+      await publishApp(onPublish, params, options)
     } catch (error) {
       console.warn('[app-publisher] publish failed', error)
       setPublished(false)

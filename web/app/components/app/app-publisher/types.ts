@@ -8,6 +8,7 @@ export type AppPublisherPublishParams = ModelAndParameter | PublishWorkflowParam
 
 export type AppPublisherPublishOptions = {
   showSuccessToast?: boolean
+  syncWorkflowTool?: boolean
 }
 
 type AppPublisherPublishHandler =

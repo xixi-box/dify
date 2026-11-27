@@ -203,7 +203,11 @@ const FeaturesTrigger = () => {
         const res =
           publishKind === 'evaluation'
             ? await publishEvaluationWorkflow(input)
-            : await publishWorkflow(input).catch((error: PublishWorkflowError) => {
+            : await publishWorkflow(
+                options?.syncWorkflowTool
+                  ? { ...input, body: { ...input.body, sync_workflow_tool: true } }
+                  : input,
+              ).catch((error: PublishWorkflowError) => {
                 if (!isTriggerNodeLimitError(error)) toast.error(error.message)
                 throw error
               })

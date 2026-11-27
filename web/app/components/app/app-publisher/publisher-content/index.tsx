@@ -214,6 +214,11 @@ export function PublisherContent({
             published: publish.published,
             publishedAt: publish.currentPublishedAt,
             startNodeLimitExceeded,
+            showSyncWorkflowTool:
+              workflowTool.visible &&
+              workflowTool.published &&
+              workflowTool.availableForUser &&
+              appDetail.workflow_kind !== 'evaluation',
             upgradeHighlightStyle,
             versionInfo: publish.publishedWorkflow,
           },
@@ -248,6 +253,7 @@ export function PublisherContent({
             workflowToolIsLoading: workflowTool.configuration.isLoading,
             workflowToolMessage: workflowTool.message,
             workflowToolOutdated: workflowTool.configuration.outdated,
+            workflowToolUpdatePending: workflowTool.configuration.updatePending,
             workflowKindChangePending,
             onConfigureWorkflowTool: workflowTool.openDrawer,
             onPublishToMarketplace: marketplace.publish,

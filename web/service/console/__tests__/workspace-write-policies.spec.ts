@@ -146,7 +146,7 @@ describe('workflow publish policies', () => {
       input: { params: { evaluate_target_id: 'app-1', evaluate_target_type: 'apps' } },
     })
 
-  it('refreshes evaluation metrics after a standard publish', async () => {
+  it('refreshes evaluation metrics and workflow tool details after a standard publish', async () => {
     const { context, invalidatedKeys } = setup()
     const publish = workflows.publish.post.mutationOptions()
 
@@ -158,6 +158,11 @@ describe('workflow publish policies', () => {
     )
 
     expect(invalidatedKeys()).toContainEqual(defaultMetricsKey)
+    expect(invalidatedKeys()).toContainEqual(
+      consoleQuery.workspaces.current.toolProvider.workflow.get.get.key({
+        input: { query: { workflow_app_id: params.app_id } },
+      }),
+    )
   })
 
   it('refreshes the app, its workflow, and evaluation lists after an evaluation publish', async () => {

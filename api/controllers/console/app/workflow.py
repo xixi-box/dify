@@ -25,7 +25,7 @@ from constants.trigger import TRIGGER_SCHEDULE_NODE_TYPE
 from controllers.common.controller_schemas import DefaultBlockConfigQuery, WorkflowListQuery, WorkflowUpdatePayload
 from controllers.common.errors import InvalidArgumentError
 from controllers.common.fields import GeneratedAppResponse, NewAppResponse, SimpleResultResponse
-from controllers.common.rbac import PlainApp, RBACCheck
+from controllers.common.rbac import PlainApp, RBACCheck, Workspace, enforce_rbac_checks
 from controllers.common.schema import (
     query_params_from_model,
     register_response_schema_model,
@@ -104,6 +104,7 @@ from services.errors.evaluation import (
 )
 from services.errors.llm import InvokeRateLimitError
 from services.errors.workflow_service import WorkflowDraftInitializationBusyError
+from services.tools.workflow_tools_manage_service import WorkflowToolManageService
 from services.trigger.debug_service import TriggerDebugEvent
 from services.workflow_ref_service import WorkflowRefService
 from services.workflow_service import DraftWorkflowDeletionError, WorkflowInUseError, WorkflowService
@@ -201,6 +202,13 @@ class DraftWorkflowNodeRunPayload(BaseWorkflowRunPayload):
 class PublishWorkflowPayload(BaseModel):
     marked_name: str | None = Field(default=None, max_length=20)
     marked_comment: str | None = Field(default=None, max_length=100)
+
+
+class PublishAppWorkflowPayload(PublishWorkflowPayload):
+    sync_workflow_tool: bool = Field(
+        default=False,
+        description="Advance an existing Workflow Tool if the published workflow preserves its interface.",
+    )
 
 
 class ConvertToWorkflowPayload(BaseModel):
@@ -497,6 +505,7 @@ register_schema_models(
     DraftWorkflowRunPayload,
     DraftWorkflowNodeRunPayload,
     PublishWorkflowPayload,
+    PublishAppWorkflowPayload,
     DefaultBlockConfigQuery,
     ConvertToWorkflowPayload,
     WorkflowKindConvertQuery,
@@ -1351,7 +1360,7 @@ class PublishedWorkflowApi(Resource):
         return dump_response(WorkflowResponse, WorkflowResponseSource(workflow, session=session))
 
     @error_responses(PaidPlanRequiredError, TriggerNodeLimitExceededError)
-    @console_ns.expect(console_ns.models[PublishWorkflowPayload.__name__])
+    @console_ns.expect(console_ns.models[PublishAppWorkflowPayload.__name__])
     @console_ns.response(200, "Workflow published successfully", console_ns.models[WorkflowPublishResponse.__name__])
     @setup_required
     @login_required
@@ -1360,11 +1369,21 @@ class PublishedWorkflowApi(Resource):
     @get_app_model(mode=[AppMode.ADVANCED_CHAT, AppMode.WORKFLOW])
     @with_current_user
     @edit_permission_required
-    @model_validate(PublishWorkflowPayload)
-    def post(self, args: PublishWorkflowPayload, current_user: Account, app_model: App):
+    @model_validate(PublishAppWorkflowPayload)
+    def post(self, args: PublishAppWorkflowPayload, current_user: Account, app_model: App):
+        """Publish the admitted app's draft and optionally advance its compatible tool.
+
+        The tool update requires workspace tool-management access. The workflow,
+        App pointer, and any tool version change commit or roll back together.
         """
-        Publish workflow
-        """
+        if args.sync_workflow_tool:
+            if not current_user.is_admin_or_owner:
+                raise Forbidden()
+            enforce_rbac_checks(
+                tenant_id=app_model.tenant_id,
+                account_id=current_user.id,
+                checks=(RBACCheck(RBACPermission.TOOL_MANAGE, Workspace()),),
+            )
 
         workflow_service = WorkflowService()
         with session_factory.get_session_maker().begin() as session:
@@ -1388,6 +1407,8 @@ class PublishedWorkflowApi(Resource):
             # Update app_model within the same session to ensure atomicity
             app_model_in_session = session.get(App, app_model.id)
             if app_model_in_session:
+                if args.sync_workflow_tool and app_model_in_session.mode == AppMode.WORKFLOW:
+                    WorkflowToolManageService.sync_published_version(session=session, workflow=workflow)
                 app_model_in_session.workflow_id = workflow.id
                 app_model_in_session.updated_by = current_user.id
                 app_model_in_session.updated_at = naive_utc_now()

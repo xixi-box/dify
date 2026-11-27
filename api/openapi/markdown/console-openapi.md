@@ -5763,7 +5763,10 @@ Get published workflow for an application
 | default | Error | **application/json**: [ErrorResponse](#errorresponse)<br> |
 
 ### [POST] /apps/{app_id}/workflows/publish
-**Publish workflow**
+**Publish the admitted app's draft and optionally advance its compatible tool**
+
+The tool update requires workspace tool-management access. The workflow,
+App pointer, and any tool version change commit or roll back together.
 
 #### Parameters
 
@@ -5775,7 +5778,7 @@ Get published workflow for an application
 
 | Required | Schema |
 | -------- | ------ |
-|  Yes | **application/json**: [PublishWorkflowPayload](#publishworkflowpayload)<br> |
+|  Yes | **application/json**: [PublishAppWorkflowPayload](#publishappworkflowpayload)<br> |
 
 #### Responses
 
@@ -35275,6 +35278,14 @@ Model class for provider with models response.
 | provider | string |  | Yes |
 | status | [CustomConfigurationStatus](#customconfigurationstatus) | Provider status. `active` when credentials are configured and valid. | Yes |
 | tenant_id | string |  | Yes |
+
+#### PublishAppWorkflowPayload
+
+| Name | Type | Description | Required |
+| ---- | ---- | ----------- | -------- |
+| marked_comment | string |  | No |
+| marked_name | string |  | No |
+| sync_workflow_tool | boolean | Advance an existing Workflow Tool if the published workflow preserves its interface. | No |
 
 #### PublishWorkflowPayload
 

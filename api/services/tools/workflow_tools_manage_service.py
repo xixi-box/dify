@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import delete, or_, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from core.tools.__base.tool_provider import ToolProviderController
 from core.tools.entities.api_entities import ToolApiEntity, ToolProviderApiEntity
@@ -14,9 +14,10 @@ from core.tools.workflow_as_tool.provider import WorkflowToolProviderController
 from core.tools.workflow_as_tool.tool import WorkflowTool
 from extensions.ext_database import db
 from graphon.model_runtime.utils.encoders import jsonable_encoder
+from graphon.nodes import BuiltinNodeTypes
 from models.model import App
 from models.tools import WorkflowToolProvider
-from models.workflow import Workflow
+from models.workflow import Workflow, WorkflowDataError, WorkflowKind
 from services.tools.tools_transform_service import ToolTransformService
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,75 @@ class WorkflowToolManageService:
     """
     Service class for managing workflow tools.
     """
+
+    @classmethod
+    def sync_published_version(cls, *, session: Session, workflow: Workflow) -> None:
+        """Advance a tenant's existing tool if the new publication preserves its interface.
+
+        The caller must have publish and tool-management access and own the
+        publication transaction. The provider lock serializes this decision
+        with manual saves. An ineligible or unsupported workflow leaves the
+        pinned version untouched. A successful sync only changes the version
+        and its update timestamp, and is committed by the caller.
+        """
+        if workflow.resolved_kind != WorkflowKind.STANDARD or workflow.version == Workflow.VERSION_DRAFT:
+            return
+        provider = session.scalar(
+            select(WorkflowToolProvider)
+            .where(
+                WorkflowToolProvider.tenant_id == workflow.tenant_id,
+                WorkflowToolProvider.app_id == workflow.app_id,
+            )
+            .with_for_update()
+        )
+        if provider is None:
+            return
+
+        pinned = session.scalar(
+            select(Workflow).where(
+                Workflow.tenant_id == provider.tenant_id,
+                Workflow.app_id == provider.app_id,
+                Workflow.version == provider.version,
+                Workflow.version != Workflow.VERSION_DRAFT,
+            )
+        )
+        if pinned is None or pinned.resolved_kind != WorkflowKind.STANDARD:
+            return
+
+        try:
+            contract = cls._workflow_tool_contract(workflow)
+            if contract is None or contract != cls._workflow_tool_contract(pinned):
+                return
+            # Validate against the exact saved parameter names and exposure settings.
+            WorkflowToolProviderController.build_tool(provider, workflow, author="")
+        except (ValueError, TypeError, AttributeError, KeyError, WorkflowDataError):
+            return
+
+        provider.version = workflow.version
+
+    @staticmethod
+    def _workflow_tool_contract(workflow: Workflow) -> str | None:
+        """Read the stored Start, End and file-upload contract without mutating the workflow.
+
+        A standard tool requires a Start node and cannot use trigger or Human
+        Input V2 nodes. Compare the full persisted field definitions, including
+        output selectors, so unfamiliar schema fields also require manual review.
+        """
+        starts: list[object] = []
+        ends: list[tuple[str, object]] = []
+        for node_id, data in workflow.walk_nodes():
+            if data["type"] == BuiltinNodeTypes.START:
+                starts.append(data.get("variables", []))
+            elif data["type"] == BuiltinNodeTypes.END:
+                ends.append((node_id, data.get("outputs", [])))
+            elif data["type"] == BuiltinNodeTypes.HUMAN_INPUT and data.get("version") == "2":
+                return None
+        if len(starts) != 1 or workflow.has_trigger_node():
+            return None
+        return json.dumps(
+            [starts[0], ends, workflow.normalized_features_dict.get("file_upload")],
+            sort_keys=True,
+        )
 
     @staticmethod
     def create_workflow_tool(
@@ -123,7 +193,11 @@ class WorkflowToolManageService:
         labels: list[str] | None = None,
     ):
         """
-        Update a workflow tool.
+        Update a workflow tool in the tenant and pin it to the current publication.
+
+        Read the App pointer after locking the provider so a manual save and a
+        publish-time sync cannot overwrite each other's work. A validation
+        failure rolls back the provider edits.
 
         :param user_id: the user id
         :param tenant_id: the tenant id
@@ -155,39 +229,24 @@ class WorkflowToolManageService:
         if existing_workflow_tool_provider is not None:
             raise ValueError(f"Tool with name {name} already exists")
 
-        # query the workflow tool provider
-        workflow_tool_provider: WorkflowToolProvider | None = None
-        with sessionmaker(db.engine, expire_on_commit=False).begin() as _session:
+        with sessionmaker(db.engine).begin() as _session:
+            # Take the same lock as workflow publication before reading the App pointer.
             workflow_tool_provider = _session.scalar(
                 select(WorkflowToolProvider)
                 .where(WorkflowToolProvider.tenant_id == tenant_id, WorkflowToolProvider.id == workflow_tool_id)
-                .limit(1)
+                .with_for_update()
             )
+            if workflow_tool_provider is None:
+                raise ValueError(f"Tool {workflow_tool_id} not found")
 
-        # if not found raise error
-        if workflow_tool_provider is None:
-            raise ValueError(f"Tool {workflow_tool_id} not found")
-
-        # query the app and its published workflow in the same session
-        app: App | None = None
-        workflow: Workflow | None = None
-        with sessionmaker(db.engine, expire_on_commit=False).begin() as _session:
             app = _session.scalar(
-                select(App).where(App.id == workflow_tool_provider.app_id, App.tenant_id == tenant_id).limit(1)
+                select(App).where(App.id == workflow_tool_provider.app_id, App.tenant_id == tenant_id)
             )
-            if app is not None:
-                workflow = app.workflow_with_session(session=_session)
-
-        # if not found raise error
-        if app is None:
-            raise ValueError(f"App {workflow_tool_provider.app_id} not found")
-
-        # if not found raise error
-        if workflow is None:
-            raise ValueError(f"Workflow not found for app {workflow_tool_provider.app_id}")
-
-        with sessionmaker(db.engine).begin() as _session:
-            _session.add(workflow_tool_provider)
+            if app is None:
+                raise ValueError(f"App {workflow_tool_provider.app_id} not found")
+            workflow = app.workflow_with_session(session=_session)
+            if workflow is None:
+                raise ValueError(f"Workflow not found for app {workflow_tool_provider.app_id}")
 
             # update workflow tool provider
             workflow_tool_provider.name = name
